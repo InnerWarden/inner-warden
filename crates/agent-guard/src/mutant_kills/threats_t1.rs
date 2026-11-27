@@ -85,7 +85,9 @@ fn an_options_value_before_the_guard_program_feeds_it_no_words() {
 #[test]
 fn the_words_a_substitution_prints_are_read_as_the_command() {
     let line = crate::shell_words::read_line("run $(echo a b) c");
-    let shown: Vec<String> = words_with_substitutions_shown(&line.commands[0].words)
+    let words = &line.commands[0].words;
+    let shown: Vec<String> = words_with_substitutions_shown(words, &program_places::places(words))
+        .0
         .into_iter()
         .map(|word| word.text)
         .collect();

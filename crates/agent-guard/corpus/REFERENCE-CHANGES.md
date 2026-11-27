@@ -633,3 +633,44 @@ harmless. A malicious or `must_refuse` line cannot be waived here.
   a key used by the client, public files or settings read on the other
   host, a remote line whose output is held in a variable, and a public key
   printed by `cat` into a value.
+- 2026-11-27: guard-name-places-2026-11 is new, and guard-lowering-evasions
+  grows by gle-031 to gle-039. The guard's name is its program only where
+  a program runs (`threats::program_places`): the command word, the word a
+  launcher runs (now `rtk` too, in both launcher readings), the command
+  `find -exec` or `fd -x` runs (the found file itself where `{}` is the
+  program), the package `cargo run` builds and runs, the command `ssh`
+  hands the far shell. An argument of a program whose arguments are data
+  is a mention, refused only with what lowers the guard written after it;
+  an argument of a program the line does not know, with a word the text
+  does not show after it, is held for review. A value the line gives a
+  name is spelled only where a program runs; a `NAME=value` after the
+  program is that program's argument, no value of the shell. The guard
+  doubt reading (`threats::guard_doubt`) reads a variable given one written
+  value as that value where the command stands, and refuses a construct it
+  does not follow only where the guard's name stands where a value or a
+  program comes from, holding it for review otherwise. A stop or removal
+  names the guard only where the word is its name or one of its places
+  (`~/github/_innerwarden/...` is a folder of one's own; a path from the
+  folder the line runs in, a path through a value, and a home the line
+  redirects still are); a removal matches as the program a command runs,
+  never as letters inside a word (`rm ` in a host name). A read of the
+  guard's store (`/var/lib/innerwarden`) is held for review; a look at its
+  files' names or modes is not a read. An `ssh` whose output a test
+  compares or `echo` prints is read as one whose output a variable holds.
+  gle-031 to gle-039 and gnp-001 to gnp-024 are must_refuse, held by
+  `tests/guard/guard_name_where_a_program_runs.rs`. gwm-c01 moves its
+  `expect` from review to allow: a folder of one's own in the middle of a
+  path. Against the merge base no line of any other corpus or variant moved
+  to a weaker verdict but real-030 (deny to review, its `expect`), in the
+  empty home and in the home with keys. In the release safety suite
+  real-030 goes from deny to review and own-015, own-048 and own-052 of
+  own-work from review to allow (folders of one's own named after the
+  guard, in a worktree and in a path).
+  harmless-proven:
+  guard-name-places-2026-11/gnp-c01 guard-name-places-2026-11/gnp-c04 guard-name-places-2026-11/gnp-c05 guard-name-places-2026-11/gnp-c07 guard-name-places-2026-11/gnp-c11 guard-name-places-2026-11/gnp-c13 guard-name-places-2026-11/gnp-c14 guard-name-places-2026-11/gnp-c15 guard-name-places-2026-11/gnp-c19 real/real-030
+  go from deny to allow or review for the reasons above: a test filter or
+  a package named after the guard, a build of it run through a variable
+  given its path, a worktree in a folder of one's own on another host, a
+  host whose name holds `rm `, a long value spelled into arguments, the ssh
+  client behind `rtk` or compared by a test, a read of the store held for
+  review, and a build of the guard handed to a script by its path.

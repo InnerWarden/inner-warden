@@ -151,7 +151,7 @@ fn reading_at(line: &str, depth: u8) -> Option<String> {
         // reads (`cat "$(ssh h 'echo /home/u/.ssh/id_rsa')"`, `cat "$(awk
         // '...' ~/.ssh/config)"`): a command inside one is read as written,
         // unless the substitution is the whole value of a variable.
-        if prints_into_the_line(command) {
+        if prints_into_the_line(command, source) {
             continue;
         }
         for argument in command_arguments(command) {
@@ -293,9 +293,10 @@ fn each_variable_names_a_folder(word: &str) -> bool {
 /// Whether what `node` prints stands in the line around it: `node` is
 /// inside a process substitution, or inside a command substitution that is
 /// not the whole value of a variable (`out=$(ssh h 'tail log')`,
-/// `out="$(...)"`). A value is held, not read; a substitution in a word of
-/// a command may be the path that command reads.
-fn prints_into_the_line(node: tree_sitter::Node<'_>) -> bool {
+/// `out="$(...)"`) nor a word a test compares or a command only prints
+/// ([`compared_or_printed`]). A value is held, not read; a substitution in
+/// a word of any other command may be the path that command reads.
+fn prints_into_the_line(node: tree_sitter::Node<'_>, source: &[u8]) -> bool {
     let mut around = node.parent();
     while let Some(parent) = around {
         match parent.kind() {
@@ -306,13 +307,47 @@ fn prints_into_the_line(node: tree_sitter::Node<'_>) -> bool {
                     .filter(|holder| holder.kind() == "string" && holder.named_child_count() == 1)
                     .and_then(|string| string.parent())
                     .or_else(|| parent.parent());
-                if !holder.is_some_and(|holder| holder.kind() == "variable_assignment") {
+                if !holder.is_some_and(|holder| holder.kind() == "variable_assignment")
+                    && !compared_or_printed(parent, source)
+                {
                     return true;
                 }
             }
             _ => {}
         }
         around = parent.parent();
+    }
+    false
+}
+
+/// Whether a command substitution stands in a word that is only compared
+/// or printed, never opened: a word of a test (`[ "$(ssh h 'cat /run/x')" =
+/// ok ]`, `[[ ... ]]`, `test`) or an argument of `echo` or `printf`. What it
+/// prints is a value there, as it is assigned to a variable: no file is
+/// read by its name. Under any other command it may be the path that
+/// command reads (`cat "$(ssh h 'echo /home/u/.ssh/id_rsa')"`).
+fn compared_or_printed(substitution: tree_sitter::Node<'_>, source: &[u8]) -> bool {
+    let mut around = substitution.parent();
+    while let Some(node) = around {
+        match node.kind() {
+            "test_command" => return true,
+            "command" => {
+                let name = node
+                    .child_by_field_name("name")
+                    .map(|name| super::node_text(name, source))
+                    .map(|name| super::normalized_command_name(&name));
+                return name
+                    .is_some_and(|name| matches!(name.as_str(), "echo" | "printf" | "test" | "["));
+            }
+            "string"
+            | "concatenation"
+            | "binary_expression"
+            | "unary_expression"
+            | "parenthesized_expression"
+            | "negated_command" => {}
+            _ => return false,
+        }
+        around = node.parent();
     }
     false
 }

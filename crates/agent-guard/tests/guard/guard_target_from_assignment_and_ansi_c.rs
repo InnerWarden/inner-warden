@@ -139,13 +139,16 @@ fn a_repository_slug_in_a_path_is_an_argument() {
         "ls a/innerwarden/$j",
         "R=InnerWarden/innerwarden-skill; gh pr list --repo $R --json number,title; P=$(gh pr list --repo $R --head release/community-1.6.14 --json number --jq '.[0].number'); gh pr diff $P --repo $R --name-only",
         "R=InnerWarden/inner-warden; gh pr view 1 --repo $R",
+        // An argument of a program whose arguments are data is a mention,
+        // even where an expansion may finish the name (since 2026-11-27).
+        "gh api x innerwarden$j",
     ] {
         assert_eq!(verdict(line), "allow", "{line}");
     }
-    // The guard's name where an expansion may finish it, or as a program in a
-    // folder, still counts.
+    // The guard's name where an expansion may finish it as a program, or as
+    // a program in a folder, still counts.
     for line in [
-        "gh api x innerwarden$j",
+        "innerwarden$j",
         "/opt/innerwarden/$X agent kernel claude-code off",
         "\"$HOME/.local/bin/innerwarden\" dry-run",
     ] {

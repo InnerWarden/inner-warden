@@ -83,6 +83,15 @@ struct GatePlace {
     /// it lower it: first as written, then when a program before the
     /// command adds words of its own.
     lowered: [bool; 2],
+    /// A word names a kernel guard and a word after it, as written, lowers
+    /// it: a verb that lowers, `scope-agent` and its `--clear`, or `arm`
+    /// and its path option. What the text does not show is not taken for
+    /// one.
+    lowered_written: bool,
+    /// A word is the path option of `arm` as written ([`is_path_option`]).
+    path: bool,
+    /// A word says `arm`, and one after it is its path option as written.
+    arm_path: bool,
     /// A word says a verb that lowers ([`KERNEL_GUARD_VERBS`]).
     verb: bool,
     /// A word says `scope-agent`.
@@ -379,6 +388,10 @@ impl WordsAfter {
                             next.lowered[0] || guard && lowers(false),
                             next.lowered[1] || guard && lowers(true),
                         ],
+                        lowered_written: next.lowered_written
+                            || guard && (next.verb || next.scope_cleared || next.arm_path),
+                        path: next.path || is_path_option(word),
+                        arm_path: next.arm_path || arm && next.path,
                         verb: next.verb || says_any(word, &KERNEL_GUARD_VERBS),
                         scope: next.scope || scope,
                         scope_cleared: next.scope_cleared || scope && next.clear,
@@ -492,6 +505,25 @@ impl WordsAfter {
         }
     }
 
+    /// What the words from place `from` on write out after a word that may
+    /// name a guard program where no program runs (an argument): `agent
+    /// kernel` right after it and a word that is not a read, a kernel guard
+    /// and a verb that lowers it, `lsm --apply`, `disarm` or
+    /// `--self-approve`. A word the text does not show, or words a program
+    /// before it adds, are not read as the verb there: an argument is a
+    /// mention unless what lowers the guard is written after it.
+    pub(super) fn found_written(&self, program: GuardProgram, from: usize) -> bool {
+        match (&self.kept, program) {
+            (_, GuardProgram::Not) => false,
+            (Kept::Kernel(held), _) => self.guard_verbs_after_any_program(held, from),
+            (Kept::ExecGate(held), _) => {
+                held[from].lowered_written || held[from].lsm_place[0] == LSM_APPLIED
+            }
+            (Kept::Disarm(held), GuardProgram::Is) => held[from].0,
+            (Kept::Disarm(held), GuardProgram::Maybe) => held[from].1,
+        }
+    }
+
     /// The words of a guard program's command line: whether they change the
     /// kernel protection. `fed`: a program before it adds words of its own.
     fn kernel_arguments_change(
@@ -602,6 +634,13 @@ mod tests {
             let after = WordsAfter::read(look, words);
             for from in 0..=words.len() {
                 for (kind, count) in yes[which].iter_mut().enumerate() {
+                    // What is written after a word where no program runs.
+                    assert_eq!(
+                        after.found_written(program(kind), from),
+                        look.found_written(program(kind), &words[from..]),
+                        "{look:?} written, program {kind}, from {from}: {:?}",
+                        words.iter().map(|word| &word.text).collect::<Vec<_>>()
+                    );
                     for flags in 0..8 {
                         let (fed, later, runs) = (flags & 1 != 0, flags & 2 != 0, flags & 4 != 0);
                         let once = after.found(program(kind), from, fed, later, runs);

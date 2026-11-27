@@ -340,7 +340,7 @@ cases:
   - id: gwm-c01
     category: guard_word_mention
     label: benign
-    expect: review
+    expect: allow
     input: "git worktree remove '/home/u/work/innerwarden/wt-324'"
   - id: gwm-c02
     category: guard_word_mention

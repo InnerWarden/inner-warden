@@ -29,6 +29,9 @@ pub struct Word {
     pub sh_alt: Option<String>,
     /// The length of `lit` right after that `$'...'`.
     pub ansi_len: usize,
+    /// Each `$NAME` and `${NAME}` in it with nothing else inside the
+    /// braces: where its [`EXPANSION`] stands in `lit`, and the name.
+    pub names: Vec<(usize, String)>,
     brace_open: bool,
     brace_list: bool,
 }
@@ -204,6 +207,16 @@ impl<'a> Lexer<'a> {
     fn mark_expansion(&mut self) {
         let frame = self.top();
         let word = frame.word.get_or_insert_with(Word::default);
+        word.lit.push(EXPANSION);
+        word.expansion = true;
+    }
+
+    /// An expansion of the variable `name` alone starts in the current word.
+    fn mark_named_expansion(&mut self, name: &[u8]) {
+        let frame = self.top();
+        let word = frame.word.get_or_insert_with(Word::default);
+        word.names
+            .push((word.lit.len(), String::from_utf8_lossy(name).into_owned()));
         word.lit.push(EXPANSION);
         word.expansion = true;
     }
@@ -626,7 +639,19 @@ impl<'a> Lexer<'a> {
             // `$"..."`: a translated string, read as a double-quoted one.
             b'"' if !quoted => i + 1,
             b'{' => {
-                self.mark_expansion();
+                // `${NAME}`, nothing else inside the braces.
+                let name_end = text[i + 2..]
+                    .iter()
+                    .position(|b| !(b.is_ascii_alphanumeric() || *b == b'_'))
+                    .map(|at| i + 2 + at);
+                match name_end {
+                    Some(end)
+                        if end > i + 2 && text[end] == b'}' && !text[i + 2].is_ascii_digit() =>
+                    {
+                        self.mark_named_expansion(&text[i + 2..end]);
+                    }
+                    _ => self.mark_expansion(),
+                }
                 self.push(Kind::Param);
                 i + 2
             }
@@ -646,7 +671,7 @@ impl<'a> Lexer<'a> {
                 while end < n && (text[end].is_ascii_alphanumeric() || text[end] == b'_') {
                     end += 1;
                 }
-                self.mark_expansion();
+                self.mark_named_expansion(&text[i + 1..end]);
                 end
             }
             b'[' => {

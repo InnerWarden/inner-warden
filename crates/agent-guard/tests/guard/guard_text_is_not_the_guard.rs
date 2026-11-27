@@ -253,6 +253,12 @@ fn a_quoted_expansion_after_the_guard_name_stays_refused() {
     // `$N`, which the line does not set; still not refused
     // (fail closed on what the guard cannot read, `src/shell/unread_parts.rs`).
     assert_eq!(verdict("iwt read test001 innerwarden \"$N\"").0, "review");
+    // A program the line does not know handed the guard's name with a word
+    // the text does not show after it: held for review, as above.
+    assert_eq!(
+        verdict("iwt read test001 innerwarden $(echo 80)").0,
+        "review"
+    );
 }
 
 /// What the readings above must not let through: the guard run by path, by
@@ -273,7 +279,6 @@ fn the_guard_run_by_path_variable_or_built_words_stays_refused() {
         "xargs innerwarden \"$X\"",
         "innerwarden \"$@\"",
         "innerwarden $ARGS",
-        "iwt read test001 innerwarden $(echo 80)",
         // The kernel protection, with one word not shown.
         "innerwarden agent kernel \"$X\"",
         "innerwarden agent \"$X\" off",
@@ -297,11 +302,13 @@ fn the_guard_run_by_path_variable_or_built_words_stays_refused() {
 /// `git worktree remove` of one is not disabling the guard. Measured
 /// 2026-11-24 on main 30ce33d: each line was a deny for "disable
 /// InnerWarden (flags between verb and target)"; the same worktree named
-/// through `~` with no hidden folder was already a review.
+/// through `~` with no hidden folder was already a review. Since
+/// 2026-11-27 the guard's name in the middle of a path to something else
+/// (a folder of one's own) is no target of a stop or a removal at all
+/// (`innerwarden_names_the_guard`), so they pass.
 ///
-/// FAILS ON REVERT of `hidden_part` (the `.worktrees` lines) or of
-/// `home_kept` in `reads_whole` (the `$HOME` lines), mention.rs: each
-/// is a deny again.
+/// FAILS ON REVERT of `innerwarden_names_the_guard` in
+/// `check_disable_verb_reaches_target`: each is held for review again.
 #[test]
 fn a_worktree_in_a_folder_named_for_the_guard_is_not_disabling_it() {
     for line in [
@@ -311,7 +318,7 @@ fn a_worktree_in_a_folder_named_for_the_guard_is_not_disabling_it() {
         "git worktree remove --force $HOME/innerwarden/wt-review",
         "git -C $HOME/innerwarden/inner-warden worktree remove --force $HOME/innerwarden/wt-review",
     ] {
-        assert_eq!(verdict(line).0, "review", "{line}");
+        assert_eq!(verdict(line).0, "allow", "{line}");
     }
     // The guard's own places, its programs and its name stay refused,
     // through `.worktrees` and through `$HOME`, and so does a `$HOME`

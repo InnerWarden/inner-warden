@@ -10,6 +10,8 @@ pub(crate) use guard_lowering::lists_only_other_processes;
 mod credential_removal_by_code;
 mod guard_takedown;
 mod instruction_files;
+mod program_places;
+use program_places::WordPlace;
 pub(crate) mod resource_limits;
 mod words_after;
 pub(crate) use credential_removal_by_code::interpreter_code_removes_credentials;
@@ -719,12 +721,14 @@ pub fn check_guard_self_disable(content: &str) -> Option<(&'static str, u32)> {
     // the name (`'i'w dry-run`) (live gate of Active Defence 0.17.7, L1).
     // The most expanded reading is checked first, the line as written last.
     let (readings, settled) = guard_readings(content);
-    if let Some(hit) = readings
-        .iter()
-        .rev()
-        .find_map(|reading| guard_self_disable_as_read(reading))
-    {
-        return Some(hit);
+    // A reading only held for review gives way to a refusal another
+    // reading, or a rule below, finds.
+    let mut held = None;
+    for reading in readings.iter().rev() {
+        match guard_self_disable_as_read(reading) {
+            Some(hit) if hit.1 > GUARD_HELD_SCORE => return Some(hit),
+            hit => held = stronger(held, hit),
+        }
     }
     // A child agent started with the hook that screens it switched off or
     // moved away: the guard's own hook, taken off one level down.
@@ -740,16 +744,24 @@ pub fn check_guard_self_disable(content: &str) -> Option<(&'static str, u32)> {
     // Asked of every reading: the verb may show only once a value is read
     // into the line (`B=dry; $GUARDBIN ${B}-run`). Asked after the readings,
     // so a line a reading refuses keeps the reason the reading gives for it.
-    if readings
+    let doubts: Vec<Option<guard_doubt::Doubt>> = readings
         .iter()
-        .any(|reading| guard_doubt::unread_beside_guard_word(reading))
-    {
+        .map(|reading| guard_doubt::doubt_beside_guard_word(reading))
+        .collect();
+    if doubts.contains(&Some(guard_doubt::Doubt::Refused)) {
         return Some((GUARD_WORD_NOT_FOLLOWED, 60));
+    }
+    // Beside a guard name that is only an argument or a mention: held.
+    if doubts.contains(&Some(guard_doubt::Doubt::Held)) {
+        held = stronger(held, Some((GUARD_PROGRAM_HANDED_ON, GUARD_HELD_SCORE)));
     }
     // Values that name one another without end, or grow past the limit, leave
     // a line that was not read to its last form: refused when it touches the
     // guard, as a reading cut short is ([`runs_guard_loosening_verb`]).
-    (!settled && line_touches_guard(content)).then_some((VALUES_NOT_SETTLED, 60))
+    if !settled && line_touches_guard(content) {
+        return Some((VALUES_NOT_SETTLED, 60));
+    }
+    held
 }
 
 /// The readings of a line [`check_guard_self_disable`] asks its rules
@@ -3416,7 +3428,8 @@ fn guard_self_disable_by_words(content: &str) -> Option<(&'static str, u32)> {
             let renamed = mentions_any(content, &["kernel"]) && changes_kernel_protection(content);
             return renamed.then_some((KERNEL_PROTECTION_CHANGE, 60));
         }
-        if let Some(refusal) = guard_words_refusal(content) {
+        let words = guard_words_refusal(content);
+        if let Some(refusal) = words.filter(|(_, score)| *score > GUARD_HELD_SCORE) {
             return Some(refusal);
         }
         if content.contains(['*', '?', '[']) && runs_guard_loosening_verb(content) {
@@ -3425,9 +3438,9 @@ fn guard_self_disable_by_words(content: &str) -> Option<(&'static str, u32)> {
         // A line the rewrite leaves as it is has no name either.
         let normalized = normalize_command(content);
         if !(mentions_any(&normalized, NEEDLES) || names_guard_alias(&normalized)) {
-            return None;
+            return words;
         }
-        return guard_self_disable_in(&normalized);
+        return stronger(guard_self_disable_in(&normalized), words);
     }
     if let Some(hit) = guard_self_disable_in(content) {
         return Some(hit);
@@ -3461,6 +3474,34 @@ const GUARD_WORD_NOT_FOLLOWED: &str =
      read (a function, an alias, `eval`, or a variable or a command substitution where the \
      command stands), so it may be one of the guard's own loosening commands: write a guard \
      command out in plain words on a line of its own";
+
+/// Where the words a shell takes for assignments end in a command: before
+/// the program it runs (alone, in front of it, or given to a launcher such
+/// as `env` or `sudo`), or at the end among the words of `export`,
+/// `declare` and the other builtins that set one, or of a command whose
+/// launcher is not read. A `NAME=value` after that is the program's
+/// argument.
+fn assignments_end(words: &[crate::shell_words::Word]) -> usize {
+    let texts: Vec<String> = words.iter().map(|w| w.text.clone()).collect();
+    match launched_command_index(&texts) {
+        Some(at) if !VARIABLE_SETTERS.contains(&program_name(&texts[at]).as_str()) => at,
+        _ => words.len(),
+    }
+}
+
+/// What [`check_guard_self_disable`] says of a guard program named as an
+/// argument of a program the line does not show to be one whose arguments
+/// are data (a script, a function, an interpreter, a launcher it does not
+/// read), with words after it the text does not show ([`Looks::HELD`]): that
+/// program may run the guard with them. Held for review, not refused: the
+/// person reading it knows what the program does.
+const GUARD_PROGRAM_HANDED_ON: &str =
+    "hands the guard's program to another program, with words after it that the guard does \
+     not read, so that program may run one of the guard's own loosening commands: run the \
+     guard by its own name, or write its words out";
+
+/// The score of [`GUARD_PROGRAM_HANDED_ON`]: a review.
+const GUARD_HELD_SCORE: u32 = 25;
 
 /// What [`check_guard_self_disable`] says of a line that touches the guard
 /// with values that never settle ([`assignment_readings`]). The line may
@@ -3629,7 +3670,10 @@ pub(crate) fn check_guard_takedown(content: &str) -> Option<(&'static str, u32)>
         .find_map(|line| {
             check_guard_takedown(line)
                 .or_else(|| check_guard_self_disable(line))
-                .or_else(|| check_security_tamper(line))
+                // A read of the guard's store a search runs is still a read.
+                .or_else(|| {
+                    check_security_tamper(line).filter(|(what, _)| *what != GUARD_STORE_READ)
+                })
         })
         .map(|_| (SEARCH_RUNS_TAKEDOWN, 60))
         .or_else(|| {
@@ -4127,10 +4171,29 @@ fn guard_self_disable_patterns() -> &'static [(regex::Regex, &'static str, u32)]
 fn guard_self_disable_after_patterns(content: &str) -> Option<(&'static str, u32)> {
     // The same two refusals on the words the shell hands the program: a
     // guard program named by a glob, a bracket expression or a value the
-    // line assigned (`/usr/local/sbin/inner*-ctl exec-gate disarm`).
-    if let Some(refusal) = guard_words_refusal(content) {
+    // line assigned (`/usr/local/sbin/inner*-ctl exec-gate disarm`). One
+    // only held for review gives way to a refusal the rules below find.
+    let words = guard_words_refusal(content);
+    if let Some(refusal) = words.filter(|(_, score)| *score > GUARD_HELD_SCORE) {
         return Some(refusal);
     }
+    stronger(guard_self_disable_past_words(content), words)
+}
+
+/// The stronger of two answers, by score; the first on a tie.
+fn stronger(
+    one: Option<(&'static str, u32)>,
+    other: Option<(&'static str, u32)>,
+) -> Option<(&'static str, u32)> {
+    match (one, other) {
+        (Some(one), Some(other)) if other.1 > one.1 => Some(other),
+        (None, other) => other,
+        (one, _) => one,
+    }
+}
+
+/// [`guard_self_disable_after_patterns`] past the words of the line.
+fn guard_self_disable_past_words(content: &str) -> Option<(&'static str, u32)> {
     // A line that names no guard program can still name the settings that
     // load the guard, and writing those is the quiet way out.
     let carrier = || guard_carrier_refusal(content);
@@ -4304,6 +4367,49 @@ impl Look {
         }
     }
 
+    /// [`Look::found`] for a word where no program runs (an argument): only
+    /// what the words after it write out. Read afresh, for the test that
+    /// holds [`words_after::WordsAfter::found_written`] to the same answers.
+    #[cfg(test)]
+    fn found_written(self, program: GuardProgram, arguments: &[crate::shell_words::Word]) -> bool {
+        let says = |word: &crate::shell_words::Word, verb: &str| {
+            word.is_plain() && word.text.eq_ignore_ascii_case(verb)
+        };
+        let said_after = |at: usize, verb: &dyn Fn(&crate::shell_words::Word) -> bool| {
+            arguments[at + 1..].iter().any(verb)
+        };
+        match (self, program) {
+            (_, GuardProgram::Not) => false,
+            (Look::Kernel, _) => guard_verbs_after_any_program(arguments),
+            (Look::ExecGate, _) => {
+                arguments.iter().enumerate().any(|(at, word)| {
+                    words_after::KERNEL_GUARDS
+                        .iter()
+                        .any(|name| says(word, name))
+                        && (said_after(at, &|w| {
+                            words_after::KERNEL_GUARD_VERBS
+                                .iter()
+                                .any(|verb| says(w, verb))
+                        }) || arguments[at + 1..].iter().enumerate().any(|(by, w)| {
+                            (says(w, "scope-agent")
+                                && said_after(at + 1 + by, &|w| says(w, "--clear")))
+                                || (says(w, "arm")
+                                    && said_after(at + 1 + by, &words_after::is_path_option))
+                        }))
+                }) || verb_among(arguments, |word| says(word, "lsm"))
+                    .ok()
+                    .filter(|&lsm| says(&arguments[lsm], "lsm"))
+                    .is_some_and(|lsm| arguments[lsm + 1..].iter().any(|w| says(w, "--apply")))
+            }
+            (Look::Disarm, GuardProgram::Is) => arguments
+                .iter()
+                .any(|word| says(word, "disarm") || says(word, "--self-approve")),
+            (Look::Disarm, GuardProgram::Maybe) => {
+                arguments.iter().any(|word| says(word, "--self-approve"))
+            }
+        }
+    }
+
     /// Whether code (an interpreter's, or text run as code) holds it.
     fn in_code(self, text: &str) -> bool {
         self == Look::Kernel && code_changes_kernel_protection(text)
@@ -4330,6 +4436,12 @@ impl Looks {
     /// The same kind of note: a line spelled from values runs one of the
     /// guard's own loosening verbs.
     const SPELLED_VERB: Looks = Looks(0b1_0000);
+    /// Not a look: a note that a guard program stands as an argument of a
+    /// program the line does not show to be one whose arguments are data
+    /// ([`program_places::WordPlace::Unknown`]), with words after it the text
+    /// does not show, so that program may run the guard with them. Held for
+    /// review where no look is found.
+    const HELD: Looks = Looks(0b10_0000);
     const EACH: [Look; 3] = [Look::ExecGate, Look::Disarm, Look::Kernel];
 
     fn only(look: Look) -> Looks {
@@ -4392,6 +4504,8 @@ fn guard_words_refusal(content: &str) -> Option<(&'static str, u32)> {
             KERNEL_PROTECTION_CHANGE
         };
         Some((what, 60))
+    } else if found.notes(Looks::HELD) {
+        Some((GUARD_PROGRAM_HANDED_ON, GUARD_HELD_SCORE))
     } else {
         None
     }
@@ -4449,27 +4563,33 @@ fn guard_words_found_within(
     };
     // A word that holds text the shell or a program may run: an
     // assignment's value, a word shaped like a command line, the value of
-    // an option given with it.
-    let runs_text_of = |word: &Word, later: bool, runs: bool, asked: Looks| {
-        let mut found = Looks::NONE;
-        if let Some((_, value)) = assignment_parts(word) {
-            found = guard_words_found_within(value, depth + 1, true, false, asked, within);
-        }
-        if may_be_a_command_line(word) {
-            let asked = asked.without(found);
-            // A word that is the whole of this text and reads as itself
-            // says nothing more one level in ([`word_reads_as_itself`]).
-            found = found.with(if word.text == text && word_reads_as_itself(word) {
-                asked.kept(|look| look.in_code(&word.text))
-            } else {
-                run_as_text(&word.text, later, runs, asked)
-            });
-            for value in attached_option_values(word) {
-                found = found.with(run_as_text(value, later, false, asked.without(found)));
+    // an option given with it. An argument is read as a command line only
+    // where its text shows one ([`shows_a_command_line`]): a path built
+    // from values (`~/tgt/$t/release/innerwarden`) is the argument it is,
+    // and read again as a line of its own it was that program at every
+    // level, down to the one where naming the guard is all it takes.
+    let runs_text_of =
+        |word: &Word, assigns: bool, place: WordPlace, later: bool, runs: bool, asked: Looks| {
+            let mut found = Looks::NONE;
+            if let Some((_, value)) = assignment_parts(word).filter(|_| assigns) {
+                found = guard_words_found_within(value, depth + 1, true, false, asked, within);
             }
-        }
-        found
-    };
+            let argument = matches!(place, WordPlace::Data | WordPlace::Unknown);
+            if may_be_a_command_line(word) && (!argument || shows_a_command_line(word)) {
+                let asked = asked.without(found);
+                // A word that is the whole of this text and reads as itself
+                // says nothing more one level in ([`word_reads_as_itself`]).
+                found = found.with(if word.text == text && word_reads_as_itself(word) {
+                    asked.kept(|look| look.in_code(&word.text))
+                } else {
+                    run_as_text(&word.text, later, runs, asked)
+                });
+                for value in attached_option_values(word) {
+                    found = found.with(run_as_text(value, later, false, asked.without(found)));
+                }
+            }
+            found
+        };
     let mut found = Looks::NONE;
     for (index, command) in line.commands.iter().enumerate() {
         if found.looks() == looks {
@@ -4484,12 +4604,23 @@ fn guard_words_found_within(
                 .iter()
                 .take_while(|word| assignment_parts(word).is_some());
             for word in in_front {
-                found = found.with(runs_text_of(word, later, false, looks.without(found)));
+                found = found.with(runs_text_of(
+                    word,
+                    true,
+                    WordPlace::Any,
+                    later,
+                    false,
+                    looks.without(found),
+                ));
             }
             continue;
         }
         let runs_here = runs && !later;
-        let found_in = |words: &[Word], asked: Looks| {
+        // A guard program is read as one only where a program runs; an
+        // argument is a mention unless what lowers the guard is written
+        // after it, and held for review where the program it is handed to
+        // may run it ([`program_places`]).
+        let found_in = |words: &[Word], places: &[WordPlace], asked: Looks| {
             let after: Vec<(Look, words_after::WordsAfter)> = Looks::EACH
                 .into_iter()
                 .filter(|look| asked.has(*look))
@@ -4498,9 +4629,36 @@ fn guard_words_found_within(
             let mut before = WordsFed::default();
             let mut found = Looks::NONE;
             for (at, word) in words.iter().enumerate() {
+                let place = places.get(at).copied().unwrap_or(WordPlace::Any);
+                // An argument of a program whose arguments are data finds a
+                // look only with what lowers the guard written after it:
+                // without that, what it names is not read (spelling a value
+                // into it costs from what the line is given).
+                if place == WordPlace::Data
+                    && !after
+                        .iter()
+                        .any(|(_, after)| after.found_written(GuardProgram::Is, at + 1))
+                {
+                    before.read(word, at.checked_sub(1).map(|last| &words[last]));
+                    continue;
+                }
                 let program = guard_program(word, &names, &assigned);
                 for (look, after) in &after {
-                    if after.found(program, at + 1, before.fed(), later, runs_here) {
+                    let read_whole =
+                        || after.found(program, at + 1, before.fed(), later, runs_here);
+                    let lowers = match place {
+                        WordPlace::Program | WordPlace::Any => read_whole(),
+                        WordPlace::Data => after.found_written(program, at + 1),
+                        WordPlace::Unknown => {
+                            let written = after.found_written(program, at + 1)
+                                || matches!(program, GuardProgram::Not) && read_whole();
+                            if !written && read_whole() {
+                                found = found.with(Looks::HELD);
+                            }
+                            written
+                        }
+                    };
+                    if lowers {
                         found = found.with(Looks::only(*look));
                     }
                 }
@@ -4508,11 +4666,12 @@ fn guard_words_found_within(
             }
             found
         };
-        found = found.with(found_in(words, looks.without(found)));
+        let places = program_places::places(words);
+        found = found.with(found_in(words, &places, looks.without(found)));
         // What a substitution prints becomes words of this command.
         if words.iter().any(|word| !word.substitutions.is_empty()) {
-            let shown = words_with_substitutions_shown(words);
-            found = found.with(found_in(&shown, looks.without(found)));
+            let (shown, shown_places) = words_with_substitutions_shown(words, &places);
+            found = found.with(found_in(&shown, &shown_places, looks.without(found)));
         }
         // What a value holds becomes words of this command, or text it
         // hands on. At the last level read its words are not walked: one
@@ -4521,8 +4680,8 @@ fn guard_words_found_within(
         // that level, so a value that named the guard with a verb that
         // reads (`C="inner${X} --json"; $C`, `X` holding `warden status`)
         // was refused.
-        match command_lines_spelled(words, &assigned) {
-            Some(spelled) => {
+        match command_lines_spelled(words, &assigned, &places) {
+            Ok(spelled) => {
                 for spelled in &spelled {
                     let asked = looks.without(found);
                     if depth < KERNEL_TEXT_DEPTH {
@@ -4542,7 +4701,10 @@ fn guard_words_found_within(
                     }
                 }
             }
-            None => {
+            // Left unread in an argument a program the line does not know
+            // is handed: that program may run it, so the line is held.
+            Err(WordPlace::Unknown) => found = found.with(Looks::HELD),
+            Err(_) => {
                 // The note goes with the look it explains, never without it.
                 let kernel = looks.kept(|look| look == Look::Kernel);
                 if !kernel.is_empty() {
@@ -4552,8 +4714,19 @@ fn guard_words_found_within(
         }
         // Text handed to a shell is run as written.
         let to_a_shell = runs_here && hands_its_text_to_a_shell(words);
-        for word in words {
-            found = found.with(runs_text_of(word, later, to_a_shell, looks.without(found)));
+        let assigns_to = assignments_end(words);
+        for (at, (word, place)) in words.iter().zip(&places).enumerate() {
+            // A `NAME=value` a program whose arguments are data is handed
+            // is its argument: no value of the shell, nothing it runs.
+            let assigns = at < assigns_to || *place != WordPlace::Data;
+            found = found.with(runs_text_of(
+                word,
+                assigns,
+                *place,
+                later,
+                to_a_shell,
+                looks.without(found),
+            ));
         }
         for input in &command.inputs {
             found = found.with(run_as_text(input, later, to_a_shell, looks.without(found)));
@@ -4617,13 +4790,19 @@ fn guard_words_in_afresh_within(
     // A word that holds text the shell or a program may run: an
     // assignment's value, a word shaped like a command line, the value of
     // an option given with it.
-    let runs_text_of = |word: &crate::shell_words::Word, later: bool, runs: bool| {
-        if let Some((_, value)) = assignment_parts(word) {
+    let runs_text_of = |word: &crate::shell_words::Word,
+                        assigns: bool,
+                        place: WordPlace,
+                        later: bool,
+                        runs: bool| {
+        if let Some((_, value)) = assignment_parts(word).filter(|_| assigns) {
             if guard_words_in_afresh_within(value, depth + 1, true, false, look, within) {
                 return true;
             }
         }
+        let argument = matches!(place, WordPlace::Data | WordPlace::Unknown);
         may_be_a_command_line(word)
+            && (!argument || shows_a_command_line(word))
             && (if word.text == text && word_reads_as_itself(word) {
                 look.in_code(&word.text)
             } else {
@@ -4642,41 +4821,51 @@ fn guard_words_in_afresh_within(
                 .iter()
                 .take_while(|word| assignment_parts(word).is_some());
             for word in in_front {
-                if runs_text_of(word, later, false) {
+                if runs_text_of(word, true, WordPlace::Any, later, false) {
                     return true;
                 }
             }
             continue;
         }
         let runs_here = runs && !later;
-        let found_in = |words: &[crate::shell_words::Word]| {
+        let found_in = |words: &[crate::shell_words::Word], places: &[WordPlace]| {
             let after = words_after::WordsAfter::read(look, words);
             let mut before = WordsFed::default();
             words.iter().enumerate().any(|(at, word)| {
-                let found = after.found(
-                    guard_program(word, &names, &assigned),
-                    at + 1,
-                    before.fed(),
-                    later,
-                    runs_here,
-                );
+                let place = places.get(at).copied().unwrap_or(WordPlace::Any);
+                if place == WordPlace::Data && !after.found_written(GuardProgram::Is, at + 1) {
+                    before.read(word, at.checked_sub(1).map(|last| &words[last]));
+                    return false;
+                }
+                let program = guard_program(word, &names, &assigned);
+                let read_whole = || after.found(program, at + 1, before.fed(), later, runs_here);
+                let found = match place {
+                    WordPlace::Program | WordPlace::Any => read_whole(),
+                    WordPlace::Data => after.found_written(program, at + 1),
+                    WordPlace::Unknown => {
+                        after.found_written(program, at + 1)
+                            || matches!(program, GuardProgram::Not) && read_whole()
+                    }
+                };
                 before.read(word, at.checked_sub(1).map(|last| &words[last]));
                 found
             })
         };
-        if found_in(words) {
+        let places = program_places::places(words);
+        if found_in(words, &places) {
             return true;
         }
         // What a substitution prints becomes words of this command.
-        if words.iter().any(|word| !word.substitutions.is_empty())
-            && found_in(&words_with_substitutions_shown(words))
-        {
-            return true;
+        if words.iter().any(|word| !word.substitutions.is_empty()) {
+            let (shown, shown_places) = words_with_substitutions_shown(words, &places);
+            if found_in(&shown, &shown_places) {
+                return true;
+            }
         }
         // What a value holds becomes words of this command, or text it
         // hands on.
-        match command_lines_spelled(words, &assigned) {
-            Some(spelled) => {
+        match command_lines_spelled(words, &assigned, &places) {
+            Ok(spelled) => {
                 if spelled.iter().any(|spelled| {
                     (depth < KERNEL_TEXT_DEPTH
                         && guard_words_in_afresh_within(
@@ -4692,13 +4881,16 @@ fn guard_words_in_afresh_within(
                     return true;
                 }
             }
-            None if look == Look::Kernel => return true,
-            None => {}
+            Err(WordPlace::Unknown) => {}
+            Err(_) if look == Look::Kernel => return true,
+            Err(_) => {}
         }
         // Text handed to a shell is run as written.
         let to_a_shell = runs_here && hands_its_text_to_a_shell(words);
-        for word in words {
-            if runs_text_of(word, later, to_a_shell) {
+        let assigns_to = assignments_end(words);
+        for (at, (word, place)) in words.iter().zip(&places).enumerate() {
+            let assigns = at < assigns_to || *place != WordPlace::Data;
+            if runs_text_of(word, assigns, *place, later, to_a_shell) {
                 return true;
             }
         }
@@ -5057,13 +5249,24 @@ impl WordsFed {
 /// as the words of its command line (and of what that line reads as input).
 fn words_with_substitutions_shown(
     words: &[crate::shell_words::Word],
-) -> Vec<crate::shell_words::Word> {
+    places: &[WordPlace],
+) -> (Vec<crate::shell_words::Word>, Vec<WordPlace>) {
     let mut shown = Vec::new();
-    for word in words {
+    let mut shown_places = Vec::new();
+    for (at, word) in words.iter().enumerate() {
+        let place = places.get(at).copied().unwrap_or(WordPlace::Any);
         if word.substitutions.is_empty() {
             shown.push(word.clone());
+            shown_places.push(place);
             continue;
         }
+        // What a substitution prints where a program runs may be the
+        // program, and any of its words: read as a program could be
+        // anywhere. Printed into an argument, it is that argument.
+        let printed_place = match place {
+            WordPlace::Program | WordPlace::Any => WordPlace::Any,
+            argument => argument,
+        };
         for inner in &word.substitutions {
             let line = crate::shell_words::read_line(inner);
             for command in &line.commands {
@@ -5075,8 +5278,9 @@ fn words_with_substitutions_shown(
                 }
             }
         }
+        shown_places.resize(shown.len(), printed_place);
     }
-    shown
+    (shown, shown_places)
 }
 
 /// The names a line gives a guard program: `alias k=...`, `IW=...`,
@@ -5182,7 +5386,19 @@ fn values_assigned<'a>(
             .saturating_mul(VALUE_READING_PER_BYTE)
             .saturating_add(VALUE_READING_FLOOR);
     }
-    for word in line.commands.iter().flat_map(|command| &command.words) {
+    // A `NAME=value` the shell takes for an assignment: before the program
+    // a command runs (alone, in front of it, or given to a launcher such as
+    // `env` or `sudo`), or among the words of `export`, `declare` and the
+    // other builtins that set one. After the program it is that program's
+    // argument (`make CC=x`, the command string `ssh` hands the far shell),
+    // which gives the shell no value: read as one, a quoted remote line that
+    // starts with `B=` was a value as long as that line, spelled into every
+    // `$B` read after it.
+    let assignment_places = line
+        .commands
+        .iter()
+        .flat_map(|command| command.words[..assignments_end(&command.words)].iter());
+    for word in assignment_places {
         let Some((name, value)) = assignment_parts(word) else {
             continue;
         };
@@ -5391,8 +5607,14 @@ enum Spelled {
 /// several words to the shell (`$C`), and text a shell or an `eval` handed
 /// it runs whole (`sh -c "$C"`): each such spelling that names the guard,
 /// or a word that lowers it ([`line_touches_guard`]), with the words after
-/// it. `None` when they cost more to read than the line is given
-/// ([`ValuesAssigned::pays`]).
+/// it. `Err` with the place of the word being spelled when they cost more
+/// to read than the line is given ([`ValuesAssigned::pays`]).
+///
+/// Only a word that may be a program is spelled (`places`,
+/// [`program_places`]): an argument of a program whose arguments are data
+/// changes nothing of which program runs, and a long value read into one
+/// used to leave the whole line unread (a scratchpad folder in a variable,
+/// handed to `cp` forty times).
 ///
 /// With the blank between the program and the verb inside a value of its
 /// own (`X="warden dry"; C="inner${X}-run"; $C`), the word was one that
@@ -5401,14 +5623,19 @@ enum Spelled {
 fn command_lines_spelled(
     words: &[crate::shell_words::Word],
     assigned: &ValuesAssigned,
-) -> Option<Vec<String>> {
+    places: &[WordPlace],
+) -> Result<Vec<String>, WordPlace> {
     use crate::shell_words::Mark;
     let mut lines = Vec::new();
     if !assigned.holds_a_blank() {
-        return Some(lines);
+        return Ok(lines);
     }
     for (at, word) in words.iter().enumerate() {
-        if !word.has(Mark::Expansion) || assignment_parts(word).is_some() {
+        let place = places.get(at).copied().unwrap_or(WordPlace::Any);
+        if place == WordPlace::Data
+            || !word.has(Mark::Expansion)
+            || assignment_parts(word).is_some()
+        {
             continue;
         }
         let spellings = match with_values_assigned(word, assigned) {
@@ -5416,7 +5643,7 @@ fn command_lines_spelled(
             // Not made, and the line has read all it is given: with the
             // words in front of it costly enough, the word that lowered
             // the guard was the one left unread (found 2026-11-10).
-            Spelled::TooMany if assigned.ran_out() => return None,
+            Spelled::TooMany if assigned.ran_out() => return Err(place),
             Spelled::TooMany | Spelled::Unread => continue,
         };
         for spelling in spellings {
@@ -5429,12 +5656,12 @@ fn command_lines_spelled(
                 line.push_str(&word.text);
             }
             if !assigned.pays(line.len()) {
-                return None;
+                return Err(place);
             }
             lines.push(line);
         }
     }
-    Some(lines)
+    Ok(lines)
 }
 
 /// `word` with each `$NAME` and `${NAME}` in it replaced by a value the
@@ -5543,6 +5770,16 @@ fn assignment_parts(word: &crate::shell_words::Word) -> Option<(&str, &str)> {
         .iter()
         .all(|mark| *mark == crate::shell_words::Mark::Plain);
     (valid && plain_name).then_some((name, value))
+}
+
+/// Whether a word shows a command line as written: a blank or an operator
+/// the shell hands the program as text (quoted or escaped), not one that
+/// only an expansion's value may hold.
+fn shows_a_command_line(word: &crate::shell_words::Word) -> bool {
+    word.text.chars().zip(&word.marks).any(|(c, mark)| {
+        *mark == crate::shell_words::Mark::Plain
+            && (c.is_whitespace() || matches!(c, ';' | '|' | '&' | '<' | '>' | '(' | ')' | '`'))
+    })
 }
 
 /// A word that could be a command line of its own when something runs it:
@@ -21364,12 +21601,102 @@ fn check_disable_verb_reaches_target(lower: &str) -> Option<&'static str> {
             if in_output_redirect_target(lower, target_at) {
                 continue;
             }
-            if let Some(hit) = disable_verb_before(lower, target, target_at, &ends) {
+            // Our own folders hold the guard's letters (`~/innerwarden/wt`,
+            // `~/github/_innerwarden/...`): only a name of the guard is a
+            // target ([`innerwarden_names_the_guard`]).
+            if *target == "innerwarden" && !innerwarden_names_the_guard(lower, target_at) {
+                continue;
+            }
+            // How close the verb is is read to the start of the word that
+            // names the target (`~/w/.worktrees/innerwarden`), not to the
+            // name inside it.
+            let word_at = lower[..target_at]
+                .rfind(|c: char| {
+                    c.is_whitespace() || matches!(c, ';' | '|' | '&' | '(' | '\'' | '"')
+                })
+                .map_or(0, |found| found + 1);
+            if let Some(hit) = disable_verb_before(lower, target, word_at, &ends) {
                 return Some(hit);
             }
         }
     }
     None
+}
+
+/// Whether the `innerwarden` at `at` in a line names the guard (its program,
+/// a unit, a process, a package, one of its places) and not a folder of
+/// someone else's that only holds its letters: the name starts there (no
+/// letter, digit, `-`, `_` or `.` of a longer name right before it, as in
+/// `_innerwarden` or `-innerwarden-sales`), and it is not a folder in the
+/// middle of a path to something else (`~/innerwarden/target-1`), unless
+/// that path is one of the guard's own places (`/var/lib/innerwarden/x`).
+///
+/// A path the text does not show whole before the name may be one of those
+/// places: a value other than the home folder (`$XDG_CONFIG_HOME/innerwarden`),
+/// or the home folder where the line gives `HOME` a value of its own
+/// (`export HOME=/etc; ... $HOME/innerwarden/x`).
+fn innerwarden_names_the_guard(lower: &str, at: usize) -> bool {
+    let joined = |c: char| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.');
+    if lower[..at].chars().next_back().is_some_and(joined) {
+        return false;
+    }
+    let ends = |c: char| {
+        c.is_whitespace()
+            || matches!(
+                c,
+                ';' | '|' | '&' | '(' | ')' | '<' | '>' | '\'' | '"' | '`'
+            )
+    };
+    let end = lower[at..]
+        .find(ends)
+        .map_or(lower.len(), |found| at + found);
+    if !lower[at..end].contains('/') {
+        return true;
+    }
+    let start = lower[..at].rfind(ends).map_or(0, |found| found + 1);
+    let word = &lower[start..end];
+    let before = &lower[start..at];
+    // A path from the folder the line runs in, which may be `/etc` or
+    // `/var/lib`: `innerwarden/rules` there is the guard's.
+    let relative = before
+        .split_inclusive('/')
+        .all(|part| matches!(part, "./" | "../"));
+    if relative && lower[at..end].starts_with("innerwarden/") {
+        return true;
+    }
+    let past_home = ["~/", "$home/", "${home}/"]
+        .iter()
+        .find_map(|home| before.strip_prefix(home));
+    let unshown = |text: &str| text.contains(['$', '`', '~', '*', '?', '[']);
+    match past_home {
+        Some(rest) if unshown(rest) || line_gives_home_a_value(lower) => return true,
+        None if unshown(before) => return true,
+        _ => {}
+    }
+    INNERWARDEN_SELF_PATHS
+        .iter()
+        .chain(INNERWARDEN_INSTALL_PATHS)
+        .chain(GUARD_CONFIG_PLACES)
+        .any(|place| word.contains(place))
+}
+
+/// Whether a line (lowercase) gives `HOME` a value of its own, quotes and
+/// escapes in its name read off: an assignment (`HOME=`, `export H"O"ME=`),
+/// `printf -v`, `read`, `mapfile` or `for` into it.
+fn line_gives_home_a_value(lower: &str) -> bool {
+    static GIVES: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let unquoted: String = lower
+        .chars()
+        .filter(|c| !matches!(c, '"' | '\'' | '\\'))
+        .collect();
+    GIVES
+        .get_or_init(|| {
+            regex::Regex::new(
+                r"(?:^|[^a-z0-9_])home\+?=|\bprintf\b[^;&|\n]*-v\s*home\b|\b(?:read|mapfile|readarray)\b[^;&|\n]*\bhome\b|\bfor\s+home\b",
+            )
+            .expect("static home value regex")
+        })
+        .is_match(&unquoted)
 }
 
 /// The finding of [`check_disable_verb_reaches_target`] for one mention of
@@ -21793,18 +22120,9 @@ fn security_tamper_as_written(content: &str) -> Option<(&'static str, u32)> {
         .iter()
         .chain(INNERWARDEN_INSTALL_PATHS)
         .any(|p| lower.contains(&format!("> {p}")) || lower.contains(&format!(">{p}")));
-    // Deleting or moving an InnerWarden file: a removal/move verb plus an
+    // Deleting or moving an InnerWarden file: a removal/move program plus an
     // InnerWarden path. Reading or grepping a file under /etc/innerwarden stays
-    // allowed because none of these verbs are present.
-    const REMOVAL_VERBS: &[&str] = &[
-        "rm ",
-        "rm-",
-        "unlink ",
-        "rmdir ",
-        "shred ",
-        "truncate ",
-        "mv ",
-    ];
+    // allowed because no such program runs ([`runs_a_removal`]).
     // The verb and the InnerWarden path must belong to the SAME command, exactly
     // as `destructive_rm_root` already requires. Testing both against the whole
     // string denied ordinary work whenever a removal touching something else
@@ -21813,7 +22131,7 @@ fn security_tamper_as_written(content: &str) -> Option<(&'static str, u32)> {
     // names an InnerWarden path. A support engineer reading a config beside any
     // cleanup step got told they were tampering with security monitoring.
     let removal_of_self = shell_command_segments(&lower).into_iter().any(|seg| {
-        REMOVAL_VERBS.iter().any(|v| seg.contains(v))
+        runs_a_removal(seg, 0)
             && INNERWARDEN_SELF_PATHS
                 .iter()
                 .chain(INNERWARDEN_INSTALL_PATHS)
@@ -21829,6 +22147,11 @@ fn security_tamper_as_written(content: &str) -> Option<(&'static str, u32)> {
     if redirect_over_self || removal_of_self || rewrite_of_user_unit {
         return Some(("removing or altering InnerWarden files", 60));
     }
+    // Its store read, here or on another host: what it refused and why,
+    // which a person decides an agent may see.
+    if GUARD_STORES.iter().any(|store| lower.contains(store)) && reads_a_guard_store(&lower, 0) {
+        return Some((GUARD_STORE_READ, 25));
+    }
     // A pattern broad enough to take the guard's processes with others
     // (`pkill -f proxy`, `pkill -f /usr/local/bin`, `killall -r agent`): the
     // guard goes down too, so a person decides.
@@ -21843,6 +22166,103 @@ fn security_tamper_as_written(content: &str) -> Option<(&'static str, u32)> {
         return Some((guard_lowering::UNREAD_IDS_KILLED, 25));
     }
     None
+}
+
+/// The places the guard keeps its store: Active Defence's data folder (its
+/// decisions, its database, its summaries), lowercase.
+const GUARD_STORES: &[&str] = &["/var/lib/innerwarden", "/usr/local/var/lib/innerwarden"];
+
+/// The programs that only list or describe files, their names, sizes,
+/// owners and modes, and read nothing of what they hold.
+const METADATA_PROGRAMS: &[&str] = &[
+    "ls", "stat", "du", "df", "test", "[", "[[", "realpath", "readlink", "dirname", "basename",
+    "mkdir", "touch",
+];
+
+/// Whether `text` (lowercase), read as a command line, has a command that
+/// names one of the guard's stores ([`GUARD_STORES`]) and is more than a
+/// look at its files' names and modes ([`METADATA_PROGRAMS`]): a reader, a
+/// database client, interpreter code, a `cd` into it (what runs next reads
+/// it), a search that runs a program on what it finds. In a command string
+/// handed to a shell or `ssh`, a substitution or an input as well.
+fn reads_a_guard_store(text: &str, depth: u8) -> bool {
+    if depth > KERNEL_TEXT_DEPTH {
+        return true;
+    }
+    let names = |word: &str| GUARD_STORES.iter().any(|store| word.contains(store));
+    let line = crate::shell_words::read_line(text);
+    line.commands.iter().any(|command| {
+        let words = &command.words;
+        let nested = words
+            .iter()
+            .any(|word| may_be_a_command_line(word) && reads_a_guard_store(&word.text, depth + 1))
+            || command
+                .inputs
+                .iter()
+                .any(|input| reads_a_guard_store(input, depth + 1));
+        if nested {
+            return true;
+        }
+        let texts: Vec<String> = words.iter().map(|w| w.text.clone()).collect();
+        let named = words
+            .iter()
+            .filter(|word| !may_be_a_command_line(word))
+            .any(|word| names(&word.text));
+        let looks_only = launched_command_index(&texts).is_some_and(|at| {
+            let program = program_name(&texts[at]);
+            METADATA_PROGRAMS.contains(&program.as_str())
+                || program == "find"
+                    && !texts.iter().any(|w| {
+                        matches!(
+                            w.as_str(),
+                            "-exec" | "-execdir" | "-ok" | "-okdir" | "-delete"
+                        )
+                    })
+        });
+        named && !looks_only
+    }) || line
+        .nested
+        .iter()
+        .any(|inner| reads_a_guard_store(inner, depth + 1))
+}
+
+/// What [`check_security_tamper`] says of a line that reads the guard's
+/// store ([`GUARD_STORES`]) without changing it: held for review.
+pub const GUARD_STORE_READ: &str =
+    "reads the guard's own store (its decisions, its database, its record of agents), which tells an agent what it refused and why";
+
+/// The programs that remove, empty or move a file away.
+const REMOVAL_PROGRAMS: &[&str] = &["rm", "unlink", "rmdir", "shred", "truncate", "mv"];
+
+/// Whether `text`, read as a command line, runs one of [`REMOVAL_PROGRAMS`]
+/// where a program runs ([`program_places`]): the command word, the word a
+/// launcher runs (`sudo`, `xargs`, `find -exec`), or in a command string
+/// it hands a shell (`ssh h 'sudo rm ...'`, `sh -c '...'`), a substitution
+/// or its input. Matched as a word of its own where a program runs, never
+/// as letters inside another word: a host named `h-crm` holds `rm ` and
+/// removes nothing.
+fn runs_a_removal(text: &str, depth: u8) -> bool {
+    if depth > KERNEL_TEXT_DEPTH {
+        // Past the depth read: any word that is one counts.
+        return shell_tokens(text)
+            .iter()
+            .any(|token| REMOVAL_PROGRAMS.contains(&program_name(token).as_str()));
+    }
+    let line = crate::shell_words::read_line(text);
+    line.commands.iter().any(|command| {
+        let places = program_places::places(&command.words);
+        command.words.iter().zip(&places).any(|(word, place)| {
+            matches!(place, WordPlace::Program | WordPlace::Any)
+                && REMOVAL_PROGRAMS.contains(&program_name(&word.text).as_str())
+                || may_be_a_command_line(word) && runs_a_removal(&word.text, depth + 1)
+        }) || command
+            .inputs
+            .iter()
+            .any(|input| runs_a_removal(input, depth + 1))
+    }) || line
+        .nested
+        .iter()
+        .any(|inner| runs_a_removal(inner, depth + 1))
 }
 
 /// What a `pkill -f PATTERN` does to the guard's processes, weakest first.
@@ -25491,8 +25911,91 @@ fn launcher_command_start(words: &[String], at: usize, command: &str) -> Option<
         "pkexec" => launcher_options_end(words, at, &PKEXEC),
         "runuser" => runuser_command_start(&words[at + 1..]).map(|start| at + 1 + start),
         "arch" => arch_command_start(words, at),
+        "rtk" => rtk_command_start(words, at),
         _ => None,
     }
+}
+
+/// The subcommands of `rtk` (a proxy that condenses a command's output for
+/// an agent) that run a command given after them.
+const RTK_RUNNERS: &[&str] = &["bypass", "proxy", "run", "err", "summary", "test"];
+
+/// The subcommands of `rtk` that are its own and run no command named on
+/// the line (`env` shows the environment; it is no `env` launcher).
+const RTK_OWN: &[&str] = &[
+    "read",
+    "smart",
+    "json",
+    "deps",
+    "env",
+    "log",
+    "gain",
+    "pipeline",
+    "methods",
+    "plugins",
+    "tasks",
+    "cc-economics",
+    "config",
+    "init",
+    "discover",
+    "session",
+    "telemetry",
+    "llm-proxy",
+    "learn",
+    "recall",
+    "pipe",
+    "trust",
+    "untrust",
+    "verify",
+    "hook-audit",
+    "rewrite",
+    "hook",
+    "help",
+];
+
+/// Where the command `rtk` at `at` runs starts: after its own options, the
+/// word after `bypass`, `proxy`, `run`, `err`, `summary` or `test` and their
+/// options; or its subcommand itself where that is the tool it runs (`rtk
+/// git log`, `rtk cargo test`). `None` where it runs a command string
+/// through a shell (`run -c`, `--shell`), runs none (`--version`, its own
+/// subcommands, [`RTK_OWN`]) or an option is not one it takes.
+fn rtk_command_start(words: &[String], at: usize) -> Option<usize> {
+    let mut index = at + 1;
+    while let Some(word) = words.get(index) {
+        let verbose =
+            word.len() > 1 && word.starts_with('-') && word[1..].chars().all(|c| c == 'v');
+        if !(verbose || matches!(word.as_str(), "--verbose" | "--skip-env")) {
+            break;
+        }
+        index += 1;
+    }
+    let subcommand = words.get(index)?;
+    if word_is_an_option(subcommand) || RTK_OWN.contains(&subcommand.as_str()) {
+        return None;
+    }
+    if !RTK_RUNNERS.contains(&subcommand.as_str()) {
+        return Some(index);
+    }
+    index += 1;
+    while let Some(word) = words.get(index) {
+        match word.as_str() {
+            "--" => {
+                index += 1;
+                break;
+            }
+            "--skip-env" => index += 1,
+            "-c" | "--command" | "--shell" => return None,
+            _ if word.starts_with("--command=") || word.starts_with("--shell=") => return None,
+            _ if word.starts_with('-') => return None,
+            _ => break,
+        }
+    }
+    (index < words.len()).then_some(index)
+}
+
+/// A word written as an option: `-x`, `--name`.
+fn word_is_an_option(word: &str) -> bool {
+    word.len() > 1 && word.starts_with('-')
 }
 
 /// Where the command of macOS `arch` starts: after its architecture
@@ -27475,8 +27978,12 @@ mod tests {
             "innerwarden --version 2>/dev/null",
             "grep -r foo /var/lib/innerwarden 2>/dev/null || true",
         ] {
+            // A read of the guard's store is held for review, never refused.
             assert!(
-                check_security_tamper(benign).is_none(),
+                matches!(
+                    check_security_tamper(benign),
+                    None | Some((GUARD_STORE_READ, 25))
+                ),
                 "benign command wrongly flagged as tamper: {benign}"
             );
         }
@@ -27528,9 +28035,12 @@ mod tests {
             "rm -rf ./build; cat /etc/innerwarden/agent.toml",
             "cat /etc/innerwarden/agent.toml | grep provider",
         ] {
-            assert_eq!(
-                check_security_tamper(benign),
-                None,
+            // A read of the guard's store is held for review, never refused.
+            assert!(
+                matches!(
+                    check_security_tamper(benign),
+                    None | Some((GUARD_STORE_READ, 25))
+                ),
                 "benign read flagged as self-tamper: {benign}"
             );
         }
@@ -32933,8 +33443,14 @@ mod guard_reading_tests {
         // again and its assertion fails.
         assert_eq!(check_guard_self_disable(&doubling), None);
         assert_eq!(check_guard_self_disable(&wide), None);
+        // The guard's name only printed by `echo` is a mention: the line is
+        // refused for the values it could not read.
         assert_eq!(
             check_guard_self_disable(&format!("{doubling}; echo iw")),
+            Some((VALUES_NOT_SETTLED, 60))
+        );
+        assert_eq!(
+            check_guard_self_disable(&format!("{doubling}; v1=iw")),
             Some((GUARD_WORD_NOT_FOLLOWED, 60))
         );
         assert_eq!(
@@ -33240,7 +33756,13 @@ mod guard_reading_tests {
             if read_out {
                 assert!(!assigned.pays(usize::MAX));
             }
-            command_lines_spelled(&read.commands.last().expect("a command").words, &assigned)
+            let words = &read.commands.last().expect("a command").words;
+            command_lines_spelled(
+                words,
+                &assigned,
+                &crate::threats::program_places::places(words),
+            )
+            .ok()
         };
         let lines = |texts: &[&str]| {
             Some(
@@ -35857,11 +36379,10 @@ mod word_reads_as_itself_tests {
         }
     }
 
-    /// A guard program run through a variable is not followed where the
-    /// command stands, whatever the variable was given on the line: the
-    /// line is refused, and the refusal says what was not read and how to
-    /// write the line, where it said that one of the guard's loosening
-    /// commands ran.
+    /// A guard program run through a variable the line does not give a
+    /// value it shows is not followed where the command stands: the line is
+    /// refused, and the refusal says what was not read and how to write the
+    /// line, where it said that one of the guard's loosening commands ran.
     ///
     /// FAILS ON REVERT: hand the refusal of a guard word beside a part that
     /// is not read the loosening-verb wording again and every line fails.
@@ -35869,8 +36390,6 @@ mod word_reads_as_itself_tests {
     fn a_guard_program_behind_a_variable_is_refused_with_how_to_write_it() {
         for line in [
             "IW=$(command -v innerwarden); \"$IW\" status",
-            "BIN=\"$HOME/.local/bin/innerwarden\"; \"$BIN\" status",
-            "IW=/usr/local/bin/innerwarden; \"$IW\" status",
             "innerwarden agents list --dir \"$HOME\"",
             "alias x=innerwarden",
         ] {
@@ -35879,6 +36398,36 @@ mod word_reads_as_itself_tests {
                 Some((GUARD_WORD_NOT_FOLLOWED, 60)),
                 "{line}"
             );
+        }
+    }
+
+    /// A variable given one written value on the line is that value where
+    /// the command stands: a build of the guard run by its path through it
+    /// is the guard's program, read with its words (a read passes, a
+    /// loosening verb or a word the text does not show after it is
+    /// refused).
+    ///
+    /// FAILS ON REVERT: leave the value out where the command stands
+    /// (`Judge::resolved` answering `None`) and the first list is refused.
+    #[test]
+    fn a_guard_program_behind_a_variable_given_its_path_is_read_with_its_words() {
+        for line in [
+            "BIN=\"$HOME/.local/bin/innerwarden\"; \"$BIN\" status",
+            "IW=/usr/local/bin/innerwarden; \"$IW\" status",
+            "B=/home/u/tgt/main/release/innerwarden; $B check \"rm -rf /tmp/x\"",
+            "B=/home/u/tgt/main/release/innerwarden; $B --version 2>&1 | head -1",
+        ] {
+            assert_eq!(check_guard_self_disable(line), None, "{line}");
+        }
+        for line in [
+            "B=/home/u/tgt/main/release/innerwarden; $B allow x",
+            "B=/home/u/tgt/main/release/innerwarden; $B agent kernel claude-code off",
+            "B=/home/u/tgt/main/release/innerwarden; $B \"$V\"",
+            "B=/home/u/tgt/main/release/innerwarden; B=/bin/ls; $B dry-run",
+            "IFS=_; x=iw_dry-run; $x",
+            "x='iw dry-run'; $x",
+        ] {
+            assert!(check_guard_self_disable(line).is_some(), "{line}");
         }
     }
 
@@ -36075,8 +36624,10 @@ mod guard_words_found_tests {
                 held[count] += 1;
             }
         }
-        // Measured: 1755, 2563, 1157 and 159.
-        let floors = [1_600, 2_300, 1_000, 140];
+        // Measured: 1830, 2531, 1136 and 137 (a guard program that is only
+        // an argument of a program whose arguments are data finds a look
+        // only with the verb written after it).
+        let floors = [1_600, 2_300, 1_000, 120];
         assert!(
             held.iter()
                 .zip(floors)
@@ -36122,7 +36673,8 @@ mod guard_words_found_tests {
             Some((GUARD_LOOSENING_VERB, 60))
         );
 
-        let costly = format!("v='{}'; {}", "x".repeat(4000), "true $v; ".repeat(40));
+        // Where a program runs: what that word spells decides the program.
+        let costly = format!("v='{}'; {}", "x".repeat(4000), "$v; ".repeat(40));
         let lowering = format!("{costly}{spelled}");
         let harmless = format!("{costly}X=q; X=\"a b\"; echo $X");
         for line in [&lowering, &harmless] {
@@ -36138,6 +36690,12 @@ mod guard_words_found_tests {
         // The same text with no value that holds a blank is two words to no
         // shell: nothing of it is left unread.
         assert_eq!(guard_words_refusal(costly.trim_end_matches("; ")), None);
+        // As an argument of a program whose arguments are data, a value
+        // spelled changes nothing of which program runs: it is not read,
+        // and costs nothing.
+        let arguments = format!("v='{}'; {}", "x".repeat(4000), "true $v; ".repeat(40));
+        let arguments = format!("{arguments}X=q; X=\"a b\"; echo $X");
+        assert_eq!(guard_words_refusal(&arguments), None);
         let kernel = "innerwarden-ctl agent kernel claude-code off";
         assert_eq!(
             guard_words_refusal(kernel),
