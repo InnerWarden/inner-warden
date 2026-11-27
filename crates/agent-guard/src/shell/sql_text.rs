@@ -365,6 +365,23 @@ mod tests {
     }
 
     #[test]
+    fn a_line_comment_is_skipped_to_its_end() {
+        assert!(sql_text_is_data(
+            "-- copy of the notes\nINSERT INTO t (k) VALUES ('a');"
+        ));
+        assert!(sql_text_is_data(
+            "INSERT INTO t (k) VALUES (-1); -- copy of the notes"
+        ));
+        assert!(!sql_text_is_data(
+            "INSERT INTO t (k) VALUES ('a'); -- note\ncopy t from program 'x'"
+        ));
+        // A lone minus starts no comment: what follows it is still read.
+        assert!(!sql_text_is_data(
+            "SELECT 2 - 1; COPY t FROM PROGRAM 'innerwarden disable'"
+        ));
+    }
+
+    #[test]
     fn arguments_by_client() {
         let words = |list: &[&str]| list.iter().map(|w| (*w).to_owned()).collect::<Vec<_>>();
         assert_eq!(

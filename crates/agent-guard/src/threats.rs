@@ -36172,6 +36172,10 @@ mod mutant_kills_t9;
 mod mutant_kills_t11;
 
 #[cfg(test)]
+#[path = "mutant_kills/threats_t12.rs"]
+mod mutant_kills_t12;
+
+#[cfg(test)]
 mod rm_readings_kept {
     use super::*;
 

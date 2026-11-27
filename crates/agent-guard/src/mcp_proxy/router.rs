@@ -1850,6 +1850,33 @@ mod tests {
         assert_eq!(note_of(&kept["content"][1]), text.len() - first.len());
     }
 
+    /// A text whose first word runs past the cut is held back whole: no
+    /// empty text is left in its place.
+    #[test]
+    fn a_text_cut_before_its_first_word_goes_whole() {
+        let fill = "c".repeat(MAX_SCANNED_RESULT_BYTES - 8);
+        let (kept, held) = withheld(
+            "tools/call",
+            serde_json::json!({"content": [
+                {"type": "text", "text": fill},
+                {"type": "text", "text": "d".repeat(64)},
+            ]}),
+        );
+        let blocks = kept["content"].as_array().expect("content");
+        assert_eq!(blocks.len(), 2, "{blocks:?}");
+        assert_eq!(blocks[0]["text"].as_str().map(str::len), Some(fill.len()));
+        assert_eq!(held, Some(1 + 64));
+        assert_eq!(note_of(&blocks[1]), 1 + 64);
+    }
+
+    #[test]
+    fn a_cut_inside_a_character_steps_back_to_its_start() {
+        assert_eq!(word_boundary_before("a\u{e9}", 2), 0);
+        assert_eq!(word_boundary_before("ab \u{e9}x", 4), 2);
+        assert_eq!(word_boundary_before("ab cd", 4), 2);
+        assert_eq!(word_boundary_before("ab cd", 2), 2);
+    }
+
     /// A piece that cannot be cut in place is held back whole: a resource
     /// blob read decoded, a link whose fields straddle the cut (with the
     /// fields of it already read), and a result of a shape not recognised,

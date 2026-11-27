@@ -38,3 +38,20 @@ additional_cargo_args = [
 # survivor past it and report a hang that is not one. A real hang still times
 # out, five minutes in, and still fails the job.
 minimum_test_timeout = 300
+
+# Mutants that change nothing a caller can see, each with why. A regex names
+# one mutant by its place: a change that moves the line drops the exclusion
+# and the mutant is tested again (and reported again, until the regex is
+# moved with it); it never hides another mutant.
+exclude_re = [
+  # A text over 64 bytes is no address, and neither is one of exactly 64:
+  # four parts of at most 13 bytes and three dots make 55.
+  'mcp_proxy/taint\.rs:1461:38: replace > with >= in inet_aton',
+  # The word at `index` is the `-c` flag (or a flag group holding `c`):
+  # `shell_c_script_from` steps over it as over any option, so starting
+  # there or one word later finds the same script.
+  'src/shell\.rs:13365:52: replace \+ with \* in shell_code_input',
+  'src/threats\.rs:24258:67: replace \+ with \* in shell_interpreter_executes_target',
+  # The only caller reads whether a client was found, never its words.
+  'src/shell\.rs:14130:29: replace \+ with \* in sql_client_words',
+]

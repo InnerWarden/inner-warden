@@ -988,4 +988,70 @@ mod tests {
             assert_eq!(verdict(line), "allow", "{line}");
         }
     }
+
+    #[test]
+    fn no_limit_spelled_out_is_no_lowering() {
+        for value in [
+            "unlimited",
+            "infinity",
+            "-1",
+            "",
+            "unlimited:infinity",
+            "UNLIMITED;",
+        ] {
+            assert!(!lowers(value), "{value}");
+        }
+        for value in ["0", "1024", "unlimited:0", "0:unlimited"] {
+            assert!(lowers(value), "{value}");
+        }
+    }
+
+    #[test]
+    fn prlimit_options_end_where_its_program_starts() {
+        assert_eq!(options_end("prlimit --fsize=0 claude", &[]), 18);
+        assert_eq!(options_end("prlimit -n 5 claude", &[]), 13);
+        assert_eq!(options_end("prlimit -n5 claude", &[]), 12);
+        assert_eq!(options_end("prlimit --pid 42 --fsize=0", &[]), 26);
+    }
+
+    #[test]
+    fn a_pid_option_after_the_program_is_the_programs() {
+        // A word the program is handed that starts with a separator: the
+        // `-p` in it is not `prlimit`'s.
+        assert_eq!(pid_value("prlimit --fsize=1 ,-p 42", true, &[]), None);
+        assert_eq!(
+            pid_value("prlimit -p 42 --fsize=1", true, &[]).as_deref(),
+            Some("42")
+        );
+    }
+
+    #[test]
+    fn a_pid_substitution_is_read_to_its_own_close() {
+        assert_eq!(
+            pid_value("prlimit --pid $(echo $(pgrep claude)) --fsize=0", true, &[]).as_deref(),
+            Some("$(echo $(pgrep claude))")
+        );
+    }
+
+    #[test]
+    fn the_program_prlimit_starts_is_found_past_options_and_wrappers() {
+        for line in [
+            "prlimit --fsize=0 $HOME/.local/bin/claude -p hi",
+            "prlimit --nofile=3 env claude",
+            "prlimit --nofile=3 FOO=1 claude",
+            "prlimit -n 3 -- claude",
+        ] {
+            assert!(starts_an_agent(line, &[]), "{line}");
+        }
+        for line in ["prlimit --nofile=3 make", "prlimit --pid 42 --nofile=3"] {
+            assert!(!starts_an_agent(line, &[]), "{line}");
+        }
+    }
+
+    #[test]
+    fn the_same_limit_lowered_twice_on_the_agent_stays_found() {
+        let line = "prlimit --pid $PPID --nofile=1; prlimit --pid $PPID --nofile=2";
+        assert!(read(line).agent_hook_limit, "{line}");
+        assert!(read("prlimit --pid $PPID --nofile=1").agent_hook_limit);
+    }
 }

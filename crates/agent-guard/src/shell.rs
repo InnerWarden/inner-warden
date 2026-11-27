@@ -19379,6 +19379,9 @@ mod mutant_kills_sh4;
 #[cfg(test)]
 #[path = "mutant_kills/shell_sh5.rs"]
 mod mutant_kills_sh5;
+#[cfg(test)]
+#[path = "mutant_kills/shell_sh6.rs"]
+mod mutant_kills_sh6;
 
 #[cfg(test)]
 mod line_through_links_offsets {

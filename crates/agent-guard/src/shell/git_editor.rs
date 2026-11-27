@@ -418,6 +418,15 @@ mod tests {
     }
 
     #[test]
+    fn a_message_option_takes_the_next_word() {
+        let words = |list: &[&str]| list.iter().map(|w| (*w).to_owned()).collect::<Vec<_>>();
+        assert_eq!(
+            message_texts(&words(&["--message", "rm -rf ~", "-e"])),
+            (vec!["rm -rf ~".to_owned()], false)
+        );
+    }
+
+    #[test]
     fn an_editor_is_read_behind_its_wrappers() {
         assert_eq!(editor_runs("sh"), Some(Runs::Shell));
         assert_eq!(editor_runs("/usr/bin/env bash -x"), Some(Runs::Shell));
