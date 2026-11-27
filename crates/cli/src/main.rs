@@ -2262,21 +2262,61 @@ fn hook_tool_result(payload: &str) -> Option<(String, String)> {
     if event != Some(RESULT_EVENT) {
         return None;
     }
-    let response = v.get("tool_response").or_else(|| v.get("toolResponse"))?;
-    let text = match response {
-        serde_json::Value::String(s) => s.clone(),
-        other => serde_json::to_string(other).ok()?,
-    };
-    if text.trim().is_empty() {
-        return None;
-    }
     let tool = v
         .get("tool_name")
         .or_else(|| v.get("toolName"))
         .and_then(|t| t.as_str())
         .unwrap_or("a tool")
         .to_string();
+    let response = v.get("tool_response").or_else(|| v.get("toolResponse"))?;
+    let input = v.get("tool_input").or_else(|| v.get("toolInput"));
+    let text = match result_without_the_script(&tool, input, response).as_ref() {
+        serde_json::Value::String(s) => s.clone(),
+        other => serde_json::to_string(other).ok()?,
+    };
+    if text.trim().is_empty() {
+        return None;
+    }
     Some((tool, text))
+}
+
+/// Whether `tool` is Claude Code's tool that runs a script the agent wrote
+/// and answers with the script beside what it printed: `REPL` (also named
+/// `Eval`). Its result is `{code, result, stdout, stderr, error, ...}`,
+/// where `code` is "the code that was executed".
+fn runs_the_agents_script(tool: &str) -> bool {
+    matches!(tool, "REPL" | "Eval")
+}
+
+/// The result of a call to read for the values it brought in.
+///
+/// A Bash result carries what the command printed (`stdout`, `stderr`) and
+/// never the command, so a path the agent typed in the command is never a
+/// value from its result. The REPL's result also gives back the script, and
+/// the script is the agent's own words as a Bash command is: read with it,
+/// a `cd` into the session's own worktree in the script made that path "a
+/// value from REPL", and every later command in the worktree waited for a
+/// person. So from the REPL's result, a member that is the call's member of
+/// the same name, with the same value, is left out, and what is left (what
+/// the script printed, returned or failed with, which may hold what it
+/// fetched) is read as a Bash result is. Every other tool's result is read
+/// whole, as before.
+fn result_without_the_script<'a>(
+    tool: &str,
+    input: Option<&serde_json::Value>,
+    response: &'a serde_json::Value,
+) -> std::borrow::Cow<'a, serde_json::Value> {
+    let (Some(serde_json::Value::Object(call)), serde_json::Value::Object(result)) =
+        (input, response)
+    else {
+        return std::borrow::Cow::Borrowed(response);
+    };
+    if !runs_the_agents_script(tool) {
+        return std::borrow::Cow::Borrowed(response);
+    }
+    let mut kept = result.clone();
+    kept.retain(|name, value| call.get(name) != Some(value));
+    std::borrow::Cow::Owned(serde_json::Value::Object(kept))
 }
 
 /// Raise a verdict because one of the command's arguments came from a tool
