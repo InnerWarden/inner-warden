@@ -1,0 +1,40 @@
+# cargo-mutants settings, read by every run of it in this repo (the nightly
+# diff shards and the Sunday sweep in .github/workflows/nightly-deep.yml, and
+# a local `cargo mutants`). They change how the tree is built for mutation
+# testing only; `cargo build` and `cargo test` are untouched.
+#
+# WHY THE DEPENDENCIES ARE OPTIMISED. On 2026-11-27 the unmutated test run of
+# innerwarden-agent-guard took 355 s on the runner (86 s on 2026-11-09), and
+# the nightly diff job ran out of its 75 minutes every night from 2026-11-19.
+# Measured on an 8-core box, every test binary run on its own (135 binaries,
+# 2,884 tests, 4 test threads):
+#
+#   as built today (engine at opt-level 2, dependencies at 0)   207 s
+#   the same with the dependencies at opt-level 3                58 s
+#
+# The time was not in the tests of the engine but in the regex, YAML and
+# tree-sitter code they call, unoptimised: most of the 135 binaries spend
+# about a second compiling rule sets before their first assertion. The
+# dependencies are built once per run, so optimising them costs nothing per
+# mutant. The engine keeps its opt-level 2 (Cargo.toml says why); at 0 its
+# rebuild per mutant is cheaper but its tests are slower, and on the same 25
+# mutants of 2026-11-24 (4 cores, -j 2) the run tested 17 in 30 minutes,
+# against all 25 in 29.5 minutes this way.
+#
+# No test suite is left out: a mutant in code only one suite checks would then
+# read as a survivor, and the run is under the budget without that.
+#
+# Debug info is off: nothing reads a backtrace here, and linking 135 test
+# binaries per mutant costs less without it.
+additional_cargo_args = [
+  "--config=profile.dev.package.\"*\".opt-level=3",
+  "--config=profile.dev.debug=0",
+]
+
+# The per-mutant timeout is three times the unmutated run (the workflow passes
+# --timeout-multiplier 3). With the faster baseline that is under three
+# minutes, and the slowest surviving mutant of the sample above ran 99 s of
+# tests beside another mutant's build; a busy runner could push a slow
+# survivor past it and report a hang that is not one. A real hang still times
+# out, five minutes in, and still fails the job.
+minimum_test_timeout = 300
