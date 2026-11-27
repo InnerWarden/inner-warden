@@ -114,7 +114,7 @@ pub(super) fn ssh_command_start(args: &[String]) -> Option<usize> {
 /// A line the grammar does not read whole is left as written. Every other
 /// word stays where it is, so a key copied, printed, sent on the input or
 /// named outside these places is read as before.
-pub(crate) fn secret_reading(line: &str) -> Cow<'_, str> {
+pub(crate) fn client_reading(line: &str) -> Cow<'_, str> {
     if !line.contains("ssh") {
         return Cow::Borrowed(line);
     }
@@ -124,7 +124,7 @@ pub(crate) fn secret_reading(line: &str) -> Cow<'_, str> {
     }
 }
 
-/// [`secret_reading`] of `line`, `depth` remote lines in. `None` where the
+/// [`client_reading`] of `line`, `depth` remote lines in. `None` where the
 /// line does not parse or holds nothing to read another way.
 fn reading_at(line: &str, depth: u8) -> Option<String> {
     let tree = parse_bash(line)?;
@@ -918,6 +918,12 @@ fn private_key_named(word: &str) -> Option<&'static str> {
 mod tests {
     use super::*;
 
+    /// Whether the reading of `line` is `line` itself. Compared and never
+    /// printed: a failure names the case, not what the reading holds.
+    fn read_as_written(line: &str) -> bool {
+        client_reading(line) == line
+    }
+
     fn words(line: &str) -> Vec<String> {
         line.split(' ').map(str::to_owned).collect()
     }
@@ -972,10 +978,12 @@ mod tests {
 
     #[test]
     fn a_remote_line_is_read_on_a_line_of_its_own() {
-        let reading = secret_reading("ssh -i ~/.ssh/id_k h1 'tail -n 5 /var/log/syslog'");
+        let reading = client_reading("ssh -i ~/.ssh/id_k h1 'tail -n 5 /var/log/syslog'");
         let (command, remote) = reading.split_once('\n').expect("two lines");
-        assert_eq!(command.trim_end(), "ssh -i ~/.ssh/id_k h1");
-        assert_eq!(remote, "tail -n 5 /var/log/syslog");
+        assert!(
+            command.trim_end() == "ssh -i ~/.ssh/id_k h1" && remote == "tail -n 5 /var/log/syslog",
+            "the remote line is not read on a line of its own"
+        );
     }
 
     #[test]
@@ -987,7 +995,7 @@ mod tests {
             "cat ~/.ssh/config(:s/config/id_rsa/)",
             "ssh -F ~/.ssh/config(:h)/id_rsa h1 true",
         ] {
-            assert!(secret_reading(line).contains(".ssh"), "{line}");
+            assert!(client_reading(line).contains(".ssh"), "{line}");
         }
     }
 
@@ -999,40 +1007,46 @@ mod tests {
             "IFS=/; ssh -i $HOME/.ssh/id_rsa h1 tail f",
             "ssh -i $(printf k) h1 tail f",
         ] {
-            assert_eq!(secret_reading(line), line, "{line}");
+            assert!(read_as_written(line), "{line}");
         }
         for line in [
             "ssh -p $PORT -i ~/.ssh/id_rsa h1 tail f",
             "ssh $OPTS -i ~/.ssh/id_rsa h1 tail f",
             "ssh -i ~/.ssh/id_k u@$HOST tail f",
         ] {
-            assert_eq!(secret_reading(line), line, "{line}");
+            assert!(read_as_written(line), "{line}");
         }
         for line in [
             "ssh -i $HOME/.ssh/id_k h1 tail f",
             "ssh -i \"${HOME}/.ssh/id_k\" h1 tail f",
             "ssh -i /home/$USER/.ssh/id_k h1 tail f",
         ] {
-            assert_ne!(secret_reading(line), line, "{line}");
+            assert!(!read_as_written(line), "{line}");
         }
     }
 
     #[test]
     fn a_substitution_read_as_a_value_or_as_a_public_key() {
         // The whole value of a variable: the remote line is read alone.
-        let reading = secret_reading("out=$(ssh -i ~/.ssh/id_k h1 'grep -c x log'); echo $out");
-        assert!(reading.ends_with("\ngrep -c x log"), "{reading}");
+        let reading = client_reading("out=$(ssh -i ~/.ssh/id_k h1 'grep -c x log'); echo $out");
+        assert!(
+            reading.ends_with("\ngrep -c x log"),
+            "the remote line of a variable's value is not read alone"
+        );
         // A word of a command: what it prints may be the path read.
         for line in [
             "cat \"$(ssh h1 'echo /home/u/.ssh/id_rsa')\"",
             "cat <(ssh h1 'echo x') ~/.ssh/id_rsa",
             "x=$(cat \"$(ssh h1 'echo /home/u/.ssh/id_rsa')\")",
         ] {
-            assert_eq!(secret_reading(line), line, "{line}");
+            assert!(read_as_written(line), "{line}");
         }
         // `cat` of public keys prints no path.
-        let reading = secret_reading("az vm create --ssh-key-values \"$(cat ~/.ssh/id_k.pub)\"");
-        assert!(!reading.contains(".ssh"), "{reading}");
+        let reading = client_reading("az vm create --ssh-key-values \"$(cat ~/.ssh/id_k.pub)\"");
+        assert!(
+            !reading.contains(".ssh"),
+            "a public key printed by cat still names its path"
+        );
         for kept in [
             "x=\"$(cat ~/.ssh/id_k.pub ~/.ssh/id_k)\"",
             "x=\"$(cat ~/.ssh/*.pub)\"",
@@ -1041,7 +1055,7 @@ mod tests {
             "x=\"$(awk 1 ~/.ssh/id_k.pub)\"",
             "x=\"$(cat ~/.ssh/../.ssh/id_k.pub)\"",
         ] {
-            assert!(secret_reading(kept).contains(".ssh"), "{kept}");
+            assert!(client_reading(kept).contains(".ssh"), "{kept}");
         }
     }
 
@@ -1052,37 +1066,46 @@ mod tests {
             "ssh h1 'bash -s' <<'EOF'\ncat ~/.ssh/id_rsa\nEOF",
             "ssh h1 sh <<< 'cat ~/.ssh/id_rsa'",
         ] {
-            assert_eq!(secret_reading(line), line, "{line}");
+            assert!(read_as_written(line), "{line}");
         }
     }
 
     #[test]
     fn the_settings_are_blanked_and_nothing_else() {
-        assert_eq!(
-            secret_reading("grep -n Host ~/.ssh/config ~/.ssh/config.d/x").trim_end(),
-            "grep -n Host"
+        assert!(
+            client_reading("grep -n Host ~/.ssh/config ~/.ssh/config.d/x").trim_end()
+                == "grep -n Host",
+            "the client settings read are not blanked"
         );
-        let reading = secret_reading("ssh -F ~/.ssh/config.d/w -i ~/.ssh/id_rsa h1");
-        assert_eq!(
-            reading.split_whitespace().collect::<Vec<_>>(),
-            ["ssh", "-i", "~/.ssh/id_rsa", "h1"]
+        let reading = client_reading("ssh -F ~/.ssh/config.d/w -i ~/.ssh/id_rsa h1");
+        assert!(
+            reading
+                .split_whitespace()
+                .eq(["ssh", "-i", "~/.ssh/id_rsa", "h1"]),
+            "-F with the person's settings is not blanked, or more is"
         );
         for written in [
             "grep -q 'Host h1' ~/.ssh/config || printf 'Host h1\\n' >> ~/.ssh/config",
             "grep -n h1 ~/.ssh/config; echo k >> ~/.ssh/authorized_keys",
         ] {
-            assert_eq!(secret_reading(written), written, "{written}");
+            assert!(read_as_written(written), "{written}");
         }
         let kept = "cat ~/.ssh/config.bak ~/.ssh/id_rsa";
-        assert_eq!(secret_reading(kept), kept);
+        assert!(read_as_written(kept), "{kept}");
     }
 
     #[test]
     fn an_rsync_transport_key_with_a_variable_is_the_clients() {
         let line = "rsync -a -e \"ssh -i $HOME/.ssh/id_k -o BatchMode=yes\" d/ u@h1:x/";
-        let reading = secret_reading(line);
-        assert!(!reading.contains(".ssh"), "{reading}");
-        assert!(reading.contains("-o BatchMode=yes"), "{reading}");
+        let reading = client_reading(line);
+        assert!(
+            !reading.contains(".ssh"),
+            "the key of the transport is not blanked"
+        );
+        assert!(
+            reading.contains("-o BatchMode=yes"),
+            "an option of the transport is blanked"
+        );
         for kept in [
             // The line may set the variable: it may hold a second word.
             "HOME='x ~/.ssh/id_rsa'; rsync -e \"ssh -i $HOME/.ssh/id_k\" d/ u@h1:x/",
@@ -1100,7 +1123,7 @@ mod tests {
             // A letter not known.
             "rsync -e \"ssh -Z -i $HOME/.ssh/id_k\" d/ u@h1:x/",
         ] {
-            assert_eq!(secret_reading(kept), kept);
+            assert!(read_as_written(kept), "{kept}");
         }
     }
 

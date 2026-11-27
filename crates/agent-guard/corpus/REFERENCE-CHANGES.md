@@ -610,7 +610,7 @@ harmless. A malicious or `must_refuse` line cannot be waived here.
   `-F` of `ssh`, `scp` or `sftp`) hold no secret, and the key of an
   `rsync -e` transport given through a variable the line does not set
   (`ssh -i $HOME/.ssh/id_k`) is the key the client signs in with
-  (`shell::ssh_client::secret_reading`). The line `ssh` runs on another
+  (`shell::ssh_client::client_reading`). The line `ssh` runs on another
   host is read for a secret as a line of its own, never as words of the
   `ssh` command around it, and is judged in `mcp` for what holds on any
   host (a removal, a secret read, a download run, the guard taken down),
