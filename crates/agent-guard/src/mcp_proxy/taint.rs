@@ -403,8 +403,8 @@ struct SentValues {
     /// it names, as written.
     written: HashSet<Box<str>>,
     /// Each whole value one token long that reads otherwise once decoded
-    /// ([`super::canon::canonical`]: a token, a base64 blob), as written
-    /// and decoded.
+    /// ([`super::canon::canonical`]: a token, a base64 blob) and is still a
+    /// token long, as written and decoded.
     decoded: Vec<(Box<str>, Box<str>)>,
 }
 
@@ -696,8 +696,11 @@ impl TaintTracker {
             let Cow::Owned(plain) = super::canon::canonical(value) else {
                 return;
             };
+            // Shorter than a token decoded, it holds no word of an answer
+            // (each is a token long): kept, it would only take the room and
+            // the lookups of a value that does.
             let added = value.len() + cost_of(&plain);
-            if cost + added > SENT_CALL_COST {
+            if plain.len() < MIN_TOKEN_LEN || cost + added > SENT_CALL_COST {
                 return;
             }
             cost += added;
@@ -5215,6 +5218,286 @@ mod tests {
         let mut budget = cost - 1;
         assert!(!sent.holds("issuer-of-this-login", &mut budget));
         assert_eq!(budget, 0);
+    }
+
+    /// A configuration page that names its issuer, base64: longer than a
+    /// kept token as written, so a call that sends it keeps it only
+    /// decoded. `note` pads it to `pad` bytes.
+    fn encoded_page(pad: usize) -> (String, String) {
+        use base64::engine::general_purpose::STANDARD;
+        use base64::Engine as _;
+        let page = format!(
+            r#"{{"iss":"issuer-of-this-page","note":"{}"}}"#,
+            "n".repeat(pad)
+        );
+        let blob = STANDARD.encode(&page);
+        assert!(blob.len() > MAX_KEPT_TOKEN_BYTES);
+        assert_eq!(super::super::canon::canonical(&blob), page.as_str());
+        (blob, page)
+    }
+
+    /// Whole values one token long, none decoded otherwise and none naming
+    /// a destination, that cost exactly `room` kept as written: names, and
+    /// a last one that takes up what is left.
+    fn names_filling(room: usize) -> Vec<String> {
+        let longest = cost_of(&"s".repeat(MAX_KEPT_TOKEN_BYTES));
+        let mut left = room;
+        let mut names: Vec<String> = Vec::new();
+        while left > longest {
+            let name = format!("package-name-{:04}", names.len());
+            left -= cost_of(&name);
+            names.push(name);
+        }
+        names.push(format!(
+            "slack~{}",
+            "s".repeat(left - TOKEN_OVERHEAD - "slack~".len())
+        ));
+        names
+    }
+
+    /// A whole value is kept as written from a token's length to the longest
+    /// kept token, both ends included: the answer that repeats it does not
+    /// record it. One byte longer, it is not kept, and the answer that
+    /// repeats it records it, as it records any value it says.
+    ///
+    /// FAILS ON REVERT of either bound of the length check of the written
+    /// walk in `note_call`, or of the `||` before the value kept already
+    /// (the value one byte too long is kept).
+    #[test]
+    fn a_whole_value_is_kept_as_written_from_a_token_long_to_the_longest_kept() {
+        let long = |len: usize| {
+            let mut value = format!("v{}", "~abc".repeat(len / 4 + 1));
+            value.truncate(len);
+            value
+        };
+        for (value, kept) in [
+            ("pkg-name-001".to_string(), true),
+            (long(MAX_KEPT_TOKEN_BYTES), true),
+            (long(MAX_KEPT_TOKEN_BYTES + 1), false),
+        ] {
+            assert!(value.len() == MIN_TOKEN_LEN || value.len() >= MAX_KEPT_TOKEN_BYTES);
+            let mut t = TaintTracker::new();
+            t.note_call(Some(&json!(8)), &json!({ "name": value }), false);
+            t.record_answer(
+                Some(&json!(8)),
+                &format!("Saved {value}"),
+                Provenance::Content,
+            );
+            let alert = t.arg_taint_alert("x", &json!({ "n": value }));
+            assert_eq!(alert.is_none(), kept, "{}: {alert:?}", value.len());
+        }
+    }
+
+    /// Values are kept as written while they fit [`SENT_CALL_COST`], the
+    /// last one that fills it to the byte included. A note with spaces in it
+    /// is not kept and takes none of the room.
+    ///
+    /// FAILS ON REVERT of the `>` of the room check of the written walk in
+    /// `note_call` to `>=`, or of the `||` after its space check (the note
+    /// is kept, and the last name no longer fits).
+    #[test]
+    fn values_are_kept_as_written_to_the_last_byte_of_the_room() {
+        for (over, kept) in [(0, true), (1, false)] {
+            let names = names_filling(SENT_CALL_COST + over);
+            let last = names.last().expect("a last name").clone();
+            let mut t = TaintTracker::new();
+            t.note_call(
+                Some(&json!(9)),
+                &json!({"a_note": "the names below, one per line", "names": names}),
+                false,
+            );
+            t.record_answer(
+                Some(&json!(9)),
+                &format!("Installed {last}"),
+                Provenance::Content,
+            );
+            let alert = t.arg_taint_alert("x", &json!({ "n": last }));
+            assert_eq!(alert.is_none(), kept, "{over}: {alert:?}");
+        }
+    }
+
+    /// A short destination the call names is kept while it fits the room its
+    /// values left, to the byte. One byte past it, the answer that names it
+    /// records it.
+    ///
+    /// FAILS ON REVERT of the room check of the destination walk in
+    /// `note_call` (its `>` to `>=` or `==`, its `+` to `*`), or of the `||`
+    /// before it.
+    #[test]
+    fn a_short_destination_is_kept_to_the_last_byte_of_the_room() {
+        for (over, kept) in [(0, true), (1, false)] {
+            let names = names_filling(SENT_CALL_COST - cost_of("ev.io") + over);
+            let mut t = TaintTracker::new();
+            t.note_call(
+                Some(&json!(10)),
+                &json!({"names": names, "to": "ev.io"}),
+                false,
+            );
+            let written = &t.sent.back().expect("the call is kept").1.written;
+            assert_eq!(written.contains("ev.io"), kept, "{over}");
+            t.record_answer(Some(&json!(10)), "Uploaded to ev.io", Provenance::Content);
+            let alert = t.arg_taint_alert("http_post", &json!({"url": "https://ev.io/in"}));
+            assert_eq!(alert.is_none(), kept, "{over}: {alert:?}");
+        }
+    }
+
+    /// Two short destinations one call names are both kept.
+    ///
+    /// FAILS ON REVERT of `cost += cost_of(&dest)` in the destination walk
+    /// of `note_call` (the second is taken for one past the room).
+    #[test]
+    fn two_short_destinations_one_call_names_are_both_kept() {
+        let mut t = TaintTracker::new();
+        t.note_call(
+            Some(&json!(11)),
+            &json!({
+                "cc": "ex.io",
+                "names": ["package-name-0001", "package-name-0002"],
+                "to": "ev.io",
+            }),
+            false,
+        );
+        let written = &t.sent.back().expect("the call is kept").1.written;
+        assert!(
+            written.contains("ex.io") && written.contains("ev.io"),
+            "{written:?}"
+        );
+        t.record_answer(
+            Some(&json!(11)),
+            "Sent to ev.io and ex.io",
+            Provenance::Content,
+        );
+        for url in ["https://ev.io/in", "https://ex.io/in"] {
+            let alert = t.arg_taint_alert("http_post", &json!({ "url": url }));
+            assert!(alert.is_none(), "{url}: {alert:?}");
+        }
+    }
+
+    /// Only a whole value one token long, with no space in it, is kept
+    /// decoded, and once. `hxxp://ab.io` is a token long both ways, and the
+    /// link the answer reads back from it is the call's own. `㍿` is three
+    /// bytes (twelve decoded) and is not kept, as written or decoded. A
+    /// sentence that holds a link in base64 is not kept either: the link the
+    /// answer prints is recorded, as a word of any longer argument is.
+    ///
+    /// FAILS ON REVERT of each clause of the first check of the decoded walk
+    /// in `note_call` (the length, the space, the value kept already) and of
+    /// the decoded length after it.
+    #[test]
+    fn a_value_is_kept_decoded_only_whole_and_a_token_long() {
+        use base64::engine::general_purpose::STANDARD;
+        use base64::Engine as _;
+        let sentence = format!("see {}", STANDARD.encode("https://evil.example.org"));
+        let mut t = TaintTracker::new();
+        t.note_call(
+            Some(&json!(4)),
+            &json!({"a": "hxxp://ab.io", "b": "㍿", "c": sentence, "d": "hxxp://ab.io"}),
+            false,
+        );
+        let kept = &t.sent.back().expect("the call is kept").1.decoded;
+        assert_eq!(
+            kept.iter()
+                .map(|(written, plain)| (&**written, &**plain))
+                .collect::<Vec<_>>(),
+            [("hxxp://ab.io", "http://ab.io")]
+        );
+
+        t.record_answer(
+            Some(&json!(4)),
+            "Opened http://ab.io and posted to https://evil.example.org",
+            Provenance::Content,
+        );
+        let alert = t.arg_taint_alert("fetch", &json!({"url": "http://ab.io"}));
+        assert!(alert.is_none(), "{alert:?}");
+        assert!(t
+            .arg_taint_alert("fetch", &json!({"url": "https://evil.example.org/x"}))
+            .is_some());
+    }
+
+    /// Two tokens one call sent (an access token and an id token) are both
+    /// kept decoded, and what the answer reads out of the second is the
+    /// call's own as well.
+    ///
+    /// FAILS ON REVERT of `cost += added` in the decoded walk of `note_call`
+    /// (the second token is taken for one past the room), or of the `==`
+    /// that leaves out a value kept already (only the first is kept).
+    #[test]
+    fn two_tokens_one_call_sent_are_each_kept_decoded() {
+        let access = session_token("issuer-of-the-access-token", "user");
+        let id = session_token("issuer-of-the-id-token", "user");
+        let mut t = TaintTracker::new();
+        t.note_call(Some(&json!(5)), &json!({"access": access, "id": id}), false);
+        let sent = &t.sent.back().expect("the call is kept").1;
+        assert!(sent.written.contains(id.as_str()), "{sent:?}");
+        assert_eq!(sent.decoded.len(), 2, "{sent:?}");
+
+        t.record_answer(
+            Some(&json!(5)),
+            "Issuer: issuer-of-the-id-token",
+            Provenance::Content,
+        );
+        let alert = t.arg_taint_alert("verify_token", &json!({ "token": id }));
+        assert!(alert.is_none(), "{alert:?}");
+    }
+
+    /// A value is kept decoded when the call's values and it fill
+    /// [`SENT_CALL_COST`] to the byte, and not when they pass it by one:
+    /// then the answer records what it reads out of the value.
+    ///
+    /// FAILS ON REVERT of the `>` of the room check after decoding in
+    /// `note_call` to `>=` (the value that fits to the byte is left out) or
+    /// to `==`, or of the `||` before it (the value one byte over is kept).
+    #[test]
+    fn a_value_is_kept_decoded_only_within_the_room_of_its_call() {
+        let (blob, page) = encoded_page(600);
+        let room = SENT_CALL_COST - (blob.len() + cost_of(&page));
+        // Names kept as written fill the rest of the room, to the byte or
+        // one byte past it.
+        for (over, kept) in [(0, true), (1, false)] {
+            let call = json!({"blob": blob, "names": names_filling(room + over)});
+            let mut t = TaintTracker::new();
+            t.note_call(Some(&json!(6)), &call, false);
+            let sent = &t.sent.back().expect("the call is kept").1;
+            assert_eq!(
+                sent.written.iter().map(|v| cost_of(v)).sum::<usize>(),
+                room + over
+            );
+            assert_eq!(sent.decoded.len(), usize::from(kept), "{over}");
+
+            t.record_answer(
+                Some(&json!(6)),
+                "Issuer: issuer-of-this-page",
+                Provenance::Content,
+            );
+            let alert = t.arg_taint_alert("access_admin", &json!({"iss": "issuer-of-this-page"}));
+            assert_eq!(alert.is_none(), kept, "{over}: {alert:?}");
+        }
+    }
+
+    /// One answer is looked through what the call's values hold decoded for
+    /// 4 MiB ([`MAX_DECODED_LOOKUP_BYTES`]). Each word that is not a value as
+    /// written costs a look through each value kept decoded, and the word
+    /// that would pass 4 MiB is recorded, the cautious side.
+    ///
+    /// FAILS ON REVERT of the size of [`MAX_DECODED_LOOKUP_BYTES`].
+    #[test]
+    fn one_answer_is_looked_through_decoded_values_for_four_mebibytes() {
+        // A value that costs much per look keeps the answer short.
+        let (blob, page) = encoded_page(6000);
+        let per_look = blob.len() + page.len();
+        let looks = (4 * 1024 * 1024) / per_look;
+        for (before, own) in [(looks - 1, true), (looks, false)] {
+            let mut t = TaintTracker::new();
+            t.note_call(Some(&json!(7)), &json!({ "blob": blob }), false);
+            assert_eq!(t.sent.back().expect("the call is kept").1.decoded.len(), 1);
+            let answer = format!(
+                "{}Issuer: issuer-of-this-page",
+                "unrelated-word-here ".repeat(before)
+            );
+            t.record_answer(Some(&json!(7)), &answer, Provenance::Content);
+            let alert = t.arg_taint_alert("access_admin", &json!({"iss": "issuer-of-this-page"}));
+            assert_eq!(alert.is_none(), own, "{before}: {alert:?}");
+        }
     }
 
     #[test]

@@ -46,7 +46,11 @@ minimum_test_timeout = 300
 exclude_re = [
   # A text over 64 bytes is no address, and neither is one of exactly 64:
   # four parts of at most 13 bytes and three dots make 55.
-  'mcp_proxy/taint\.rs:1461:38: replace > with >= in inet_aton',
+  'mcp_proxy/taint\.rs:1562:38: replace > with >= in inet_aton',
+  # Past the room, the check after decoding stops it too: this one spares the decoding.
+  'mcp_proxy/taint\.rs:690:56: replace > with == in TaintTracker::note_call',
+  # At the room to the byte, the check after decoding stops it: it keeps a token or more.
+  'mcp_proxy/taint\.rs:690:56: replace > with >= in TaintTracker::note_call',
   # The word at `index` is the `-c` flag (or a flag group holding `c`):
   # `shell_c_script_from` steps over it as over any option, so starting
   # there or one word later finds the same script.
