@@ -30,6 +30,7 @@ mod shell_small_edges;
 mod sql_text_is_data;
 mod sql_through_container_and_ssh;
 mod stdin_to_shell_is_script;
+mod strict_noise_of_own_work;
 mod substitution_is_a_program_in_any_slot;
 mod text_a_later_step_runs;
 mod two_folder_queries_one_line;

@@ -58,4 +58,12 @@ exclude_re = [
   'src/threats\.rs:24258:67: replace \+ with \* in shell_interpreter_executes_target',
   # The only caller reads whether a client was found, never its words.
   'src/shell\.rs:14130:29: replace \+ with \* in sql_client_words',
+  # `index * 1` adds only the command word to its own arguments, and that
+  # word is the name the arm matched (`cd`, `pushd`, `popd`): never `-`, and
+  # never a path that starts with `/`, so no arm answers otherwise.
+  'src/private_temp\.rs:61:38: replace \+ with \* in leaves_no_named_directory',
+  # The answer off unix, where no owner or mode is read. Never built where
+  # the mutants run (Linux), so no test there can reach it; the unix one is
+  # the one tested.
+  'src/private_temp\.rs:198:5: replace is_private -> bool with true',
 ]

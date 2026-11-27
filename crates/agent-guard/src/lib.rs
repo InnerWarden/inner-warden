@@ -105,6 +105,7 @@ mod arg_chain;
 mod description_poison;
 mod line_values;
 mod mention;
+mod private_temp;
 mod shell;
 mod shell_words;
 mod typosquat;

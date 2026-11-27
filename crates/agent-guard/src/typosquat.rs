@@ -163,12 +163,13 @@ enum Mode {
 }
 
 /// The package arguments of an install, a download or a fetch-and-run, with
-/// the ecosystem they name and how they are read.
+/// the ecosystem they name, how they are read and whether uv runs them
+/// (`uvx`, `uv tool run`).
 ///
 /// A run (`npx`, `uvx`, `pipx run`, `pnpm dlx`, `bunx`, ...) and a download
 /// (`pip download`, `pip wheel`) fetch the same package an install does, and a
 /// run executes it at once, so a look-alike there is the same step.
-fn install_arguments(words: &[String]) -> Option<(Ecosystem, Mode, &[String])> {
+fn install_arguments(words: &[String]) -> Option<(Ecosystem, Mode, bool, &[String])> {
     let index = effective_command_index(words)?;
     let tool = token_basename(&words[index]).to_ascii_lowercase();
     let rest = &words[index + 1..];
@@ -289,7 +290,8 @@ fn install_arguments(words: &[String]) -> Option<(Ecosystem, Mode, &[String])> {
         }
         _ => return None,
     };
-    Some((ecosystem, mode, &rest[from..]))
+    let uv_run = mode == Run && (tool == "uvx" || tool == "uv");
+    Some((ecosystem, mode, uv_run, &rest[from..]))
 }
 
 /// An option of a fetch-and-run that names a package: `npx -p pkg cmd`,
@@ -305,8 +307,30 @@ fn package_option(ecosystem: Ecosystem, option: &str) -> Option<bool> {
     }
 }
 
+/// Whether a uv run names uv's own Python interpreter: `uvx python`,
+/// `uvx python@3.12`, `uv tool run python3`, `uvx python3.12`. uv runs the
+/// interpreter it manages for these, it never fetches a PyPI package by that
+/// name, so `python` is not a look-alike of `cython`.
+fn names_uv_interpreter(argument: &str) -> bool {
+    let argument = argument.trim_matches(['\'', '"']).to_ascii_lowercase();
+    let name = argument.split('@').next().unwrap_or_default();
+    match name.strip_prefix("python") {
+        Some("" | "3") => true,
+        Some(version) => version
+            .strip_prefix("3.")
+            .is_some_and(|minor| !minor.is_empty() && minor.chars().all(|c| c.is_ascii_digit())),
+        None => false,
+    }
+}
+
 /// The package names an install or a fetch-and-run names, as typed.
-fn named_packages(ecosystem: Ecosystem, mode: Mode, arguments: &[String]) -> Vec<String> {
+/// `uv_run` is a run by uv, whose interpreter is not a package.
+fn named_packages(
+    ecosystem: Ecosystem,
+    mode: Mode,
+    uv_run: bool,
+    arguments: &[String],
+) -> Vec<String> {
     let mut named = Vec::new();
     let mut positional_is_package = true;
     let mut index = 0;
@@ -353,7 +377,7 @@ fn named_packages(ecosystem: Ecosystem, mode: Mode, arguments: &[String]) -> Vec
             Mode::Install => named.push(argument.clone()),
             Mode::Run => {
                 // Everything after the package belongs to it, not to the runner.
-                if positional_is_package {
+                if positional_is_package && !(uv_run && names_uv_interpreter(argument)) {
                     named.push(argument.clone());
                 }
                 break;
@@ -524,10 +548,10 @@ pub(crate) fn check_package_typosquat(content: &str) -> Option<(String, u32)> {
     }
     for segment in shell_command_segments(content) {
         let words = shell_tokens(segment);
-        let Some((ecosystem, mode, arguments)) = install_arguments(&words) else {
+        let Some((ecosystem, mode, uv_run, arguments)) = install_arguments(&words) else {
             continue;
         };
-        for argument in named_packages(ecosystem, mode, arguments) {
+        for argument in named_packages(ecosystem, mode, uv_run, arguments) {
             let Some(name) = package_name(ecosystem, &argument) else {
                 continue;
             };
@@ -650,6 +674,20 @@ mod tests {
             ("uvx --python 3.12 pytset --version", "pytset", "pytest"),
             ("uvx --from reqeusts some-cli", "reqeusts", "requests"),
             ("uvx --with nunpy ipython", "nunpy", "numpy"),
+            // The interpreter is uv's own; a look-alike beside it is not.
+            ("uvx --with nunpy python run.py", "nunpy", "numpy"),
+            (
+                "uvx --with numpy --with pilow python run.py",
+                "pilow",
+                "pillow",
+            ),
+            (
+                "uv tool run --with nunpy python3 -c 'print(1)'",
+                "nunpy",
+                "numpy",
+            ),
+            // One letter from a popular package is still a look-alike.
+            ("uvx cyhton", "cyhton", "cython"),
             ("uv tool run pytset", "pytset", "pytest"),
             ("uv tool install djnago", "djnago", "django"),
             ("pipx run reqeusts", "reqeusts", "requests"),
@@ -679,6 +717,15 @@ mod tests {
             "pnpm dlx create-vite my-app",
             "bunx vitest run",
             "uvx ruff check .",
+            // uv's own interpreter, with popular packages named exactly.
+            "uvx python run.py",
+            "uvx --with pillow --with numpy python tools/build.py out",
+            "uvx --with numpy,pillow python -I - <<'EOF'",
+            "uvx --python 3.12 python -c 'print(1)'",
+            "uvx python@3.12 run.py",
+            "uv tool run --with numpy python3 run.py",
+            "uvx python3.12 run.py",
+            "uv run --with numpy python run.py",
             "uvx mcp-server-git --repository reqeusts",
             "uvx --from httpie http GET https://example.com",
             "uv tool run black reqeusts.py",
@@ -691,6 +738,62 @@ mod tests {
                 check_package_typosquat(command).is_none(),
                 "must not flag: {command}"
             );
+        }
+    }
+
+    /// Only a run by uv (`uvx`, `uv tool run`) reads `python` as
+    /// uv's own interpreter: an install by uv, a run by `pipx` and a run by
+    /// `npx` name a package, and their `python` is judged as one. FAILS ON
+    /// REVERT of either half of the rule (`||` for `&&`, or `!=` for `==` on
+    /// `uv`).
+    #[test]
+    fn only_a_run_by_uv_names_uvs_interpreter() {
+        let uv_run = |line: &str| {
+            let words = shell_tokens(line);
+            install_arguments(&words)
+                .map(|(_, _, uv_run, _)| uv_run)
+                .unwrap_or_else(|| panic!("{line}: an install or a run"))
+        };
+        for line in ["uvx python run.py", "uv tool run python3 x.py"] {
+            assert!(uv_run(line), "{line}");
+        }
+        for line in [
+            "uv pip install python",
+            "uv tool install python",
+            "uv add python",
+            "pipx run python",
+            "pipx install python",
+            "npx python",
+            "pip install python",
+        ] {
+            assert!(!uv_run(line), "{line}");
+        }
+    }
+
+    /// uv's interpreter is `python`, `python3`, or `python3.<digits>`, with
+    /// or without `@version`; any other tail is a name of its own. FAILS ON
+    /// REVERT of the minor version's two conditions (`||` for `&&`).
+    #[test]
+    fn uvs_interpreter_is_python_three_and_a_numeric_minor() {
+        for name in [
+            "python",
+            "python3",
+            "python3.12",
+            "Python3.9",
+            "python@3.12",
+            "'python3.13'",
+        ] {
+            assert!(names_uv_interpreter(name), "{name}");
+        }
+        for name in [
+            "python3.",
+            "python3.x",
+            "python3.12a",
+            "python2",
+            "pythonx",
+            "python-dateutil",
+        ] {
+            assert!(!names_uv_interpreter(name), "{name}");
         }
     }
 

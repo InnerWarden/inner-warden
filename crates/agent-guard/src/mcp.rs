@@ -6021,18 +6021,26 @@ fn analyze_command_as_read(
     // Temp directory execution (score 30), also through a path the line
     // knows a variable holds (`bash "$TMPDIR/x.sh"`, `cd /tmp/x && bash
     // "$PWD/x.sh"`).
+    let known_paths = crate::shell::line_with_known_paths(scan_cmd);
     if let Some((dir, s)) = threats::check_tmp_execution(scan_cmd).or_else(|| {
-        crate::shell::line_with_known_paths(scan_cmd)
-            .and_then(|known| threats::check_tmp_execution(&known))
+        known_paths
+            .as_deref()
+            .and_then(threats::check_tmp_execution)
     }) {
         // Charged once: a line handed on that names the same folder (a test
         // file the line writes and runs, whose code opens `/tmp/foo.py`) is
         // the same finding, read in the text the line holds (benchmark of
         // 2026-11-21: two such checks were refused for the folder twice).
         let detail = format!("references world-writable directory: {dir}");
-        if !signals
-            .iter()
-            .any(|seen| seen.signal == "tmp_execution" && seen.detail.ends_with(&detail))
+        // Not charged when every temp path the line names is in a directory
+        // of the agent's own user that nobody else may write (a scratchpad
+        // made 0700 below `/tmp`), judged on the directory as it is now.
+        let mut lines = vec![scan_cmd];
+        lines.extend(known_paths.as_deref());
+        if !crate::private_temp::every_temp_path_is_private(&lines)
+            && !signals
+                .iter()
+                .any(|seen| seen.signal == "tmp_execution" && seen.detail.ends_with(&detail))
         {
             signals.push(AnalysisSignal {
                 signal: "tmp_execution".into(),
@@ -10649,6 +10657,39 @@ mod tests {
                 a.explanation
             );
         }
+    }
+
+    /// A temp folder the line runs from is charged once when a line it hands on
+    /// names the same folder, and charged again when the handed line names
+    /// another: the same signal name for another folder is its own finding.
+    #[test]
+    fn a_temp_folder_is_charged_once_and_another_folder_on_its_own() {
+        let charged = |command: &str| -> Vec<String> {
+            analyze_command(command, None)
+                .signals
+                .into_iter()
+                .filter(|s| s.signal == "tmp_execution" && s.score > 0)
+                .map(|s| s.detail)
+                .collect()
+        };
+
+        let same = charged("bash /tmp/iw-a.sh; sh -c 'bash /tmp/iw-b.sh'");
+        assert_eq!(same.len(), 1, "/tmp/ charged twice: {same:?}");
+
+        let other = charged("bash /tmp/iw-a.sh; sh -c 'bash /dev/shm/iw-b.sh'");
+        assert_eq!(other.len(), 2, "each folder charged once: {other:?}");
+        assert!(
+            other
+                .iter()
+                .any(|d| d == "references world-writable directory: /tmp/"),
+            "{other:?}"
+        );
+        assert!(
+            other
+                .iter()
+                .any(|d| d.ends_with("references world-writable directory: /dev/shm/")),
+            "{other:?}"
+        );
     }
 
     /// One observation is charged once, and the displayed scores still add up.
