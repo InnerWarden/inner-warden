@@ -23,18 +23,18 @@
 # _G, brackets, a list or a table's field; Node's fs/promises destructured or
 # imported; a shell's -c script spelled with glued quotes or backslashes; a
 # write into the guard's state folder ~/.local/state/innerwarden.
-# Their proof is tests/guard_reading_wave4b.rs.
+# Their proof is tests/guard/guard_reading_wave4b.rs.
 # rw4-36N refused, from the fifth pass: a shell's -c script written after its
 # options and a -- (bash -c -x -- LINE, sh -c -- LINE), behind env, sudo,
 # nohup or timeout --; main allowed each with score 0. rw4-08N beside them
 # are ordinary work. rw4-371..373: an order written into Claude Code's skills
 # (.claude/skills/<name>/SKILL.md) or Codex's custom prompts
 # (~/.codex/prompts/*.md), refused as one in .claude/commands; rw4-085 an
-# ordinary skill. Their proof is tests/guard_reading_wave4c.rs.
+# ordinary skill. Their proof is tests/guard/guard_reading_wave4c.rs.
 # rw4-0NN are ordinary work, allowed before and after. The refusal in
 # monitor of a write into the guard's own configuration is the hook's, not
 # the line's: it is proved in crates/cli/tests/monitor_keeps_the_guard_config.rs.
-# The proof of the rest is tests/guard_reading_wave4.rs; read by the
+# The proof of the rest is tests/guard/guard_reading_wave4.rs; read by the
 # differential check. Nothing in this file is executed.
 cases:
   # main: allow

@@ -7,7 +7,7 @@
 # holds it. The refusal depends on what the home holds: the differential check
 # and the release safety suite judge from an empty home, where there is no key
 # and these lines pass. The proof with a key in the home is
-# `tests/home_search_context_and_markers.rs`. The controls are searches of a
+# `tests/commands_a_l/home_search_context_and_markers.rs`. The controls are searches of a
 # project folder. Nothing in this file is executed.
 cases:
   - id: hs-01

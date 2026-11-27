@@ -125,7 +125,7 @@ fn a_line_handed_to_bash_c_keeps_the_checks_on_the_call() {
         json!({"command": "bash", "args": ["-c", credential], "cwd": "/srv/app", "timeout": 30}),
     );
     // A key the line only authenticates with is key use, as on the line
-    // typed directly (`tests/key_use_and_kill_all.rs`): no AG-FILE. A key
+    // typed directly (`tests/commands_a_l/key_use_and_kill_all.rs`): no AG-FILE. A key
     // the line copies or shows is refused in every shape (the test below).
     for (tool, args) in shapes("scp -i ~/.ssh/id_rsa f user@host:/tmp")
         .into_iter()

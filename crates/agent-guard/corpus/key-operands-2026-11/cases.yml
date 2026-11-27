@@ -10,7 +10,7 @@
 # through a PWD the line sets itself: must_refuse: true, expect: deny.
 # ko-c01.. are dd copies of images and devices, a public key, a pattern file,
 # and removals of project folders under $PWD: benign with no expect, so only
-# allow passes. The proof is tests/long_line_cost_pwd_and_key_operands.rs;
+# allow passes. The proof is tests/commands_l_w/long_line_cost_pwd_and_key_operands.rs;
 # read by the differential check. Nothing in this file is executed.
 cases:
   - id: ko-001

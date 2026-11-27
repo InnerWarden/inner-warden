@@ -732,7 +732,7 @@ fn a_role_or_a_type_that_is_not_the_protocols_word_is_held_back() {
 #[test]
 fn benign_prompts_and_sampling_requests_reach_the_client_unchanged() {
     let corpus: Value =
-        serde_json::from_str(include_str!("data/atr-benign-mcp.json")).expect("corpus");
+        serde_json::from_str(include_str!("../data/atr-benign-mcp.json")).expect("corpus");
     let texts: Vec<&str> = corpus["items"]
         .as_array()
         .expect("items")

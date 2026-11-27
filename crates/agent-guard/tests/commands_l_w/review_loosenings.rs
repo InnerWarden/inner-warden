@@ -19,7 +19,7 @@ fn assert_allowed(cases: &[&str]) {
 
 /// Held for review, not refused: a word of the guard that code only prints
 /// or writes into a project file is a mention (decision of the operator,
-/// 2026-11-21, `tests/guard_word_mention_and_action.rs`).
+/// 2026-11-21, `tests/guard/guard_word_mention_and_action.rs`).
 fn assert_held(cases: &[&str]) {
     for command in cases {
         let (recommendation, why) = verdict(command);

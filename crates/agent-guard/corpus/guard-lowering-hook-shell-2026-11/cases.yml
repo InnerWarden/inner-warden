@@ -11,7 +11,7 @@
 # name, the wrapper's options glued with = or
 # in another order, and the mark of each fail-closed script; controls: the
 # shell any script holds (sh -c, exit 2, esac; echo) and a folder named for
-# the guard. The proof is tests/guard_lowering_hook_shell_and_old_wrappers.rs.
+# the guard. The proof is tests/guard/guard_lowering_hook_shell_and_old_wrappers.rs.
 # Nothing in this file is executed.
 cases:
   - id: ghs-01

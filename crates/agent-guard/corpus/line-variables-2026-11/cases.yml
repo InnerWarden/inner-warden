@@ -14,7 +14,7 @@
 # function body or a pipeline), a here-string expanded before read, $PWD
 # after a cd the line does not spell out, read -s, mapfile -t, printf -v;
 # from lv-48 a value a loop gives the name later in its body.
-# The proof is tests/line_variables_reach_every_look.rs.
+# The proof is tests/commands_a_l/line_variables_reach_every_look.rs.
 # Nothing in this file is executed.
 cases:
   - id: lv-01

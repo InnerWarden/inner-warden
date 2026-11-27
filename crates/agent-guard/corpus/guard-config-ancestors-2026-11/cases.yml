@@ -15,7 +15,7 @@
 # of the differential check runs in ~/project) and held for review from
 # the text alone; gc-2NN folders the text does not read, held for review
 # (expect: review). must_refuse: true on every gc-0NN and gc-1NN. The proof
-# is tests/guard_config_commands_and_ancestors.rs; read by the differential
+# is tests/guard/guard_config_commands_and_ancestors.rs; read by the differential
 # check. Nothing in this file is executed.
 cases:
   - id: gc-001

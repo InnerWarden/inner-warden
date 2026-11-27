@@ -4,7 +4,7 @@ An **independent** mapping of InnerWarden's controls to the **OWASP Top 10 for
 Agentic Applications 2026 (ASI01–ASI10)**, published by the OWASP GenAI Security
 Project on 2025-12-09. The mapping is *derived from the code that runs*
 ([`src/asi.rs`](src/asi.rs)); the guard-layer controls are proven by
-[`tests/owasp_asi.rs`](tests/owasp_asi.rs).
+[`tests/mcp/owasp_asi.rs`](tests/mcp/owasp_asi.rs).
 
 > **InnerWarden is not endorsed or certified by OWASP.** This is an independent
 > mapping to the published framework.

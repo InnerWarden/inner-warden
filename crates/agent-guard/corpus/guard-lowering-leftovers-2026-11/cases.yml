@@ -6,7 +6,7 @@
 # purpose, pinned here); a base64 decode whose output reaches a shell
 # (must_refuse), with controls: a kill of another program, a log folder, and
 # a decode that runs nothing (gh api .../contents | base64 -d, which carried
-# a signal the hook refused). The proof is tests/guard_lowering_leftovers.rs.
+# a signal the hook refused). The proof is tests/guard/guard_lowering_leftovers.rs.
 # From glx-15, round 1 of its review: the guard's shortcuts iw and
 # iw-guard, a kill of another security control through pgrep (held, not
 # allowed), a decoded file run with options or on a shell's input, and a

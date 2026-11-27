@@ -33,7 +33,7 @@
 # A relative name read from the folder the hook was given (rm -rf
 # innerwarden/rules run in /etc) needs that folder, which this file does
 # not carry: it is in the test.
-# The proof is tests/notes_key_moves_patterns_and_home.rs; read by the
+# The proof is tests/commands_l_w/notes_key_moves_patterns_and_home.rs; read by the
 # differential check. Nothing in this file is executed.
 cases:
   # before: allow

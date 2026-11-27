@@ -35,7 +35,7 @@ struct Case {
 }
 
 fn corpus() -> Vec<Case> {
-    let text = include_str!("../corpus/instruction-orders-2026-11/cases.yml");
+    let text = include_str!("../../corpus/instruction-orders-2026-11/cases.yml");
     serde_yaml::from_str::<Corpus>(text)
         .expect("the corpus reads")
         .cases

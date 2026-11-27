@@ -12,7 +12,7 @@
 # controls (another program's unit, a pattern that cannot match a name of
 # the guard, a quoted pattern, a move into a folder of the guard that
 # replaces nothing of it, a relative name with no folder known). The proof
-# is tests/guard_files_through_patterns_and_folders.rs; read by the
+# is tests/guard/guard_files_through_patterns_and_folders.rs; read by the
 # differential check. Nothing in this file is executed.
 cases:
   # main: allow

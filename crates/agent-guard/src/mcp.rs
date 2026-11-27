@@ -6695,7 +6695,7 @@ fn analyze_command_as_read(
     // Measured 2026-11-20 on the main of that day: 49 of 80 such lines were
     // allowed (`rm -rf "$DIR"`, `$CMD -rf build`, `python3 -c "$CODE"`,
     // `bash <<EOF` with `$CMD` in its body, `kill $(cat pid)`); 46 are
-    // held now (`tests/unread_part_is_never_allowed.rs`).
+    // held now (`tests/commands_l_w/unread_part_is_never_allowed.rs`).
     if depth == 0 && score < 20 {
         if let Some(detail) = crate::shell::unread_part(cmd) {
             let lift = 20 - score;

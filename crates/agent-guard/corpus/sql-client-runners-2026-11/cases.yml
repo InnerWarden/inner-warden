@@ -9,7 +9,7 @@
 # or the runner runs as a shell (a backslash command, a dot command, system,
 # COPY ... PROGRAM, sh -c, a second command on the line, a pager, a
 # substitution), must_refuse: true with expect: deny. The proof is
-# tests/sql_through_container_and_ssh.rs; read by the differential check.
+# tests/commands_l_w/sql_through_container_and_ssh.rs; read by the differential check.
 # Known limit, not read: SQL that is data on the line can still reach a
 # shell through what the database already holds (a trigger or a user
 # function on the table, plsh and the like); the line does not show it,

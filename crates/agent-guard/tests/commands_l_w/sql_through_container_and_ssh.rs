@@ -1,7 +1,7 @@
 //! SQL handed to a SQL client that runs inside a container or on another
 //! host (`docker exec`, `podman exec`, `kubectl exec ... --`, the remote
 //! line of `ssh`) is read as the same client run here is
-//! (`tests/sql_text_is_data.rs`): a guard word inside a string of an
+//! (`tests/commands_l_w/sql_text_is_data.rs`): a guard word inside a string of an
 //! `INSERT` or `UPDATE` is a value, not a command. Measured before this
 //! reading: every line of the first test was refused as the guard switched
 //! off, because `exec` and `ssh` run their words and the line was read as

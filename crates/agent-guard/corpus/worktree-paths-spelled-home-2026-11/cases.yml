@@ -12,7 +12,7 @@
 # A relative path that climbs from a folder the line runs in that is not
 # known (no working context) is in doubt and held for review, as before:
 # it is in the test, with and without a folder, not here.
-# The proof is tests/worktree_paths_and_spelled_home.rs; read by the
+# The proof is tests/commands_l_w/worktree_paths_and_spelled_home.rs; read by the
 # differential check. Nothing in this file is executed.
 cases:
   # before: deny

@@ -25,9 +25,9 @@
 #   printf -v named through a variable. Refused.
 #   A line with any substitution before the notes is read whole, so a
 #   journal entry whose date is taken by $(date) is refused too: a known
-#   false positive, kept on purpose; tests/notes_shown_after_cat_stay_text.rs
+#   false positive, kept on purpose; tests/commands_l_w/notes_shown_after_cat_stay_text.rs
 #   holds that verdict.
-# The proof is tests/notes_shown_after_cat_stay_text.rs; read by the
+# The proof is tests/commands_l_w/notes_shown_after_cat_stay_text.rs; read by the
 # differential check. Nothing in this file is executed.
 cases:
   # before: deny

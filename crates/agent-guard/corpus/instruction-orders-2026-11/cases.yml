@@ -9,7 +9,7 @@
 # inline code: `must_refuse: true`, `expect: deny`. io-c01.. are notes,
 # build commands, style rules and a clause that forbids, written the same
 # ways: benign with no `expect`, so only allow passes. The proof is
-# `tests/agent_instruction_orders.rs`; read by the differential check.
+# `tests/commands_a_l/agent_instruction_orders.rs`; read by the differential check.
 # Nothing in this file is executed.
 cases:
   - id: io-001
