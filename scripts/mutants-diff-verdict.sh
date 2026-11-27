@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Verdict of one shard of the nightly diff mutation run
-# (.github/workflows/nightly-deep.yml, job mutants-diff).
+# Verdict of one shard of a diff mutation run
+# (.github/workflows/mutants-diff.yml, job mutate: the nightly run and the
+# run on pull requests).
 #
 # usage: mutants-diff-verdict.sh <cargo-mutants exit> <mutants.out> <mutants in shard> <label>
 #
