@@ -21,6 +21,11 @@ updates:
     schedule:
       interval: weekly
     open-pull-requests-limit: 5
+    groups:
+      # init and analyze must move together: CodeQL refuses to run when the
+      # two steps of one workflow are at different versions.
+      codeql-action:
+        patterns: ["github/codeql-action*"]
 
   - package-ecosystem: npm
     directory: /npm
