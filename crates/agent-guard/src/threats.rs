@@ -18051,7 +18051,14 @@ pub(crate) fn check_sensitive_read_as_written(
     if guard_folder_handed_to_reader(content) {
         return Some((".config/innerwarden", 60));
     }
-    sensitive_read_nested(content, as_written, 0)
+    // The ssh client's own uses (its key, its settings) are no reads, and
+    // the line it runs on another host is read as a line of its own
+    // ([`crate::shell::secret_reading`]); a private key `ssh-keygen` opens
+    // is one ([`crate::shell::private_key_opened`]).
+    let reading = crate::shell::secret_reading(content);
+    sensitive_read_nested(&reading, as_written, 0)
+        .or_else(|| crate::shell::private_key_opened(&reading))
+        .or_else(|| crate::shell::private_key_opened(&crate::shell::secret_reading(as_written)))
 }
 
 /// How deep [`sensitive_read_in`] follows a line handed to a shell inside a
@@ -27105,6 +27112,9 @@ mod tests {
             "cat ~/.ssh/authorized_keys",
             "cat docs/id_rsa.pub.example",
             "cp ~/.ssh/id_ed25519.pub /tmp/k.pub",
+            // The ssh client's settings, since 2026-11-27
+            // (`crate::shell::secret_reading`).
+            "cat ~/.ssh/config",
         ] {
             assert_eq!(check_sensitive_read(cmd), None, "{cmd}");
         }
@@ -27113,7 +27123,7 @@ mod tests {
             "cat ~/.ssh/id_ed25519.pub ~/.ssh/id_ed25519",
             "cat ~/.ssh/*.pub",
             "cat ~/.ssh/id_ed25519.p?b",
-            "cat ~/.ssh/config",
+            "cat ~/.ssh/config*",
             "tar czf k.tgz ~/.ssh",
             "cat ~/.ssh/known_hosts ~/.ssh/id_rsa",
         ] {

@@ -15,9 +15,12 @@ pub(crate) mod output_options;
 pub(crate) mod runners;
 mod sql_runner;
 mod sql_text;
+mod ssh_client;
 mod unread_parts;
 
 pub(crate) use inline_calls::InlineReading;
+pub(crate) use sql_runner::ssh_remote_lines;
+pub(crate) use ssh_client::{private_key_opened, secret_reading};
 pub(crate) use unread_parts::unread_part;
 
 const MAX_AST_DEPTH: usize = 64;

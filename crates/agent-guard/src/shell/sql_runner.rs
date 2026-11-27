@@ -15,8 +15,9 @@
 //! is read as before.
 
 use super::{
-    command_arguments, command_words, effective_command_words, node_contains_kind,
-    normalized_command_name, parse_bash, project, shell_word, sql_text,
+    collect_nodes_of_kind, command_arguments, command_words, effective_command_words,
+    node_contains_kind, normalized_command_name, parse_bash, project, shell_word, sql_text,
+    ssh_client,
 };
 use std::ops::Range;
 
@@ -170,46 +171,6 @@ fn kubectl_exec_program(args: &[String]) -> Option<usize> {
     None
 }
 
-/// `ssh` option letters that take a value, and those that take none.
-const SSH_VALUED: &str = "BbcDEeFIiJLlmOoPpQRSWw";
-const SSH_PLAIN: &str = "46AaCfGgKkMNnqsTtVvXxYy";
-
-/// Where in `args` (the words after `ssh`) the remote command starts: the
-/// first word after the destination that is not an option (`ssh` reads
-/// options again after the destination). A letter not known is `None`.
-fn ssh_command_start(args: &[String]) -> Option<usize> {
-    let mut index = 0;
-    let mut destination = false;
-    let mut options_end = false;
-    loop {
-        let arg = args.get(index)?;
-        if !options_end && arg == "--" {
-            options_end = true;
-            index += 1;
-            continue;
-        }
-        if !options_end && arg.len() > 1 && arg.starts_with('-') {
-            let mut takes_next = false;
-            for (at, letter) in arg[1..].char_indices() {
-                if SSH_VALUED.contains(letter) {
-                    takes_next = at + letter.len_utf8() == arg.len() - 1;
-                    break;
-                }
-                if !SSH_PLAIN.contains(letter) {
-                    return None;
-                }
-            }
-            index += if takes_next { 2 } else { 1 };
-            continue;
-        }
-        if destination {
-            return Some(index);
-        }
-        destination = true;
-        index += 1;
-    }
-}
-
 /// The line the remote shell of an `ssh` command reads (its words after the
 /// destination, quotes taken off, joined by a blank), and for each byte of
 /// it the byte of `source` it came from. `None` for any other command, or
@@ -219,6 +180,46 @@ pub(super) fn ssh_remote_line(
     command: tree_sitter::Node<'_>,
     source: &[u8],
 ) -> Option<(String, Vec<Option<usize>>)> {
+    remote_line_of(command, source).map(|(line, map, _)| (line, map))
+}
+
+/// [`ssh_remote_line`] with the bytes of `source` its words stand in, from
+/// the first to the last: the line `ssh` runs on the other host, and where
+/// the command holds it.
+pub(super) fn ssh_remote_words(
+    command: tree_sitter::Node<'_>,
+    source: &[u8],
+) -> Option<(String, Range<usize>)> {
+    remote_line_of(command, source).map(|(line, _, range)| (line, range))
+}
+
+/// The lines every `ssh` command of `line` runs on another host
+/// ([`ssh_remote_line`]), in the order they are written: the line itself,
+/// a pipeline, a list, a substitution or a loop holds them. A command
+/// whose remote line holds what the text does not show (an expansion in
+/// double quotes, a glob, an escaped line end) gives none.
+pub(crate) fn ssh_remote_lines(line: &str) -> Vec<String> {
+    if !line.contains("ssh") {
+        return Vec::new();
+    }
+    let Some(tree) = parse_bash(line) else {
+        return Vec::new();
+    };
+    let mut commands = Vec::new();
+    collect_nodes_of_kind(tree.root_node(), "command", &mut commands, 0);
+    commands
+        .into_iter()
+        .filter_map(|command| ssh_remote_line(command, line.as_bytes()))
+        .map(|(remote, _)| remote)
+        .collect()
+}
+
+/// [`ssh_remote_line`], [`ssh_remote_words`]: the line, the map of its
+/// bytes and the range of its words.
+fn remote_line_of(
+    command: tree_sitter::Node<'_>,
+    source: &[u8],
+) -> Option<(String, Vec<Option<usize>>, Range<usize>)> {
     let words = command_words(command, source)?;
     let effective = effective_command_words(&words, 0)?;
     if normalized_command_name(effective.first()?) != "ssh" {
@@ -228,10 +229,11 @@ pub(super) fn ssh_remote_line(
     let arguments = command_arguments(command);
     let arguments = arguments.get(skip..)?;
     let unquoted: Vec<String> = effective[1..].iter().map(|word| shell_word(word)).collect();
-    let start = ssh_command_start(&unquoted)?;
+    let start = ssh_client::ssh_command_start(&unquoted)?;
+    let remote = arguments.get(start..)?;
     let mut line = Vec::new();
     let mut map = Vec::new();
-    for (count, argument) in arguments.get(start..)?.iter().enumerate() {
+    for (count, argument) in remote.iter().enumerate() {
         if count > 0 {
             line.push(b' ');
             map.push(None);
@@ -239,7 +241,8 @@ pub(super) fn ssh_remote_line(
         let text = source.get(argument.byte_range())?;
         unquote_mapped(text, argument.start_byte(), &mut line, &mut map)?;
     }
-    String::from_utf8(line).ok().map(|line| (line, map))
+    let range = remote.first()?.start_byte()..remote.last()?.end_byte();
+    String::from_utf8(line).ok().map(|line| (line, map, range))
 }
 
 /// `text`, one shell word written at byte `base`, with its quotes taken
@@ -423,20 +426,6 @@ mod tests {
             "kubectl get pg-0 -- psql",
         ] {
             assert_eq!(sql_client_at(&words(line), 0), None, "{line}");
-        }
-    }
-
-    #[test]
-    fn the_remote_command_of_ssh_starts_after_the_destination() {
-        for (line, start) in [
-            ("host psql", Some(1)),
-            ("-p 22 host -t psql", Some(4)),
-            ("-oBatchMode=yes host psql", Some(2)),
-            ("-- host psql", Some(2)),
-            ("host", None),
-            ("-Z host psql", None),
-        ] {
-            assert_eq!(ssh_command_start(&words(line)), start, "{line}");
         }
     }
 

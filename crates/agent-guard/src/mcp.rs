@@ -3908,6 +3908,49 @@ const STARTUP_PAYLOAD_DEPTH: u8 = 2;
 /// ([`crate::shell::lines_substitutions_run`]).
 const SUBSTITUTION_HANDS_ON: &str = "in a line a substitution runs";
 
+/// How a finding of the line `ssh` runs on another host is named
+/// ([`crate::shell::ssh_remote_lines`]).
+const REMOTE_HANDS_ON: &str = "in the line ssh runs on another host";
+
+/// What a line `ssh` runs on another host is charged with: what holds on
+/// any host, as for a line run here. A removal or a wipe (of files, of a
+/// disk, of a cloud's resources), a secret read or sent out, a download run
+/// or code hidden from the reading, the guard taken down (its loosening
+/// verbs, its units stopped). The rest are checks of this host's own files
+/// and settings (what starts at boot or login, a library every process
+/// loads, permissions and owners, the shell history, an agent's settings, a
+/// container given this host, a program run from its temporary folder) or
+/// of what this reading cannot see: the other host's paths are named in
+/// that line, not this one's.
+const ANY_HOST_SIGNALS: &[&str] = &[
+    "data_destruction",
+    "destructive_command",
+    "dangerous_command",
+    "cloud_control_plane",
+    "sensitive_credential_read",
+    "credential_hunt",
+    "credential_exposure",
+    "kubernetes_secret_read",
+    "reverse_shell",
+    "bare_ip_fetch",
+    "internal_network_target",
+    "download_and_execute",
+    "download_chmod_execute",
+    "download_fed_to_script",
+    "download_run_in_text_argument",
+    "dynamic_code_execution",
+    "clone_and_run",
+    "obfuscated_command",
+    "guard_self_disable",
+    "security_tooling_tamper",
+];
+
+/// Whether a finding of a line `ssh` runs on another host is charged
+/// ([`ANY_HOST_SIGNALS`], and every fetch-and-execute finding).
+fn holds_on_any_host(signal: &str) -> bool {
+    ANY_HOST_SIGNALS.contains(&signal) || signal.starts_with("fetch_exec_")
+}
+
 /// The command as bash reads it and, where sh and dash read it differently,
 /// as they do: the reading that scores higher is the verdict.
 ///
@@ -5964,19 +6007,29 @@ fn analyze_command_as_read(
                 crate::shell::lines_substitutions_run(cmd),
                 SUBSTITUTION_HANDS_ON,
             ),
+            (crate::shell::ssh_remote_lines(cmd), REMOTE_HANDS_ON),
         ] {
             lines.retain(|line| seen.insert(line.clone()));
             if lines.is_empty() {
                 continue;
             }
+            // The line `ssh` runs on another host names that host's files:
+            // judged with no folder or home of this one and none of the
+            // paths the person protects here, and charged only with what
+            // holds on any host ([`holds_on_any_host`]).
+            let remote = handed_by == REMOTE_HANDS_ON;
             let inner = analyze_command_at(
                 &lines.join("\n"),
                 rule_engine,
-                protected_reads,
-                context,
+                if remote { &[] } else { protected_reads },
+                if remote { None } else { context },
                 depth + 1,
             );
-            for handed in inner.signals.into_iter().filter(|s| s.score > 0) {
+            for handed in inner
+                .signals
+                .into_iter()
+                .filter(|s| s.score > 0 && (!remote || holds_on_any_host(&s.signal)))
+            {
                 let fetch_exec = FETCH_EXEC_OBSERVATION.contains(&handed.signal.as_str())
                     || AGGRAVATING_SIGNAL_NAMES.contains(&handed.signal.as_str())
                     || handed.signal.starts_with("fetch_exec_")
@@ -6857,6 +6910,24 @@ fn check_shell_internal_target(command: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A name the remote line is charged with is a name a check raises: a
+    /// misspelt one would leave that finding uncharged on the other host.
+    #[test]
+    fn the_findings_charged_on_another_host_are_raised_here() {
+        for name in ANY_HOST_SIGNALS {
+            assert!(SIGNAL_NAMES.contains(name), "{name}");
+        }
+        assert!(holds_on_any_host("fetch_exec_unparsed"));
+        for host_only in [
+            "persistence_install",
+            "insecure_permissions",
+            "local_credential_or_kernel_tamper",
+            "shell_line_not_literal",
+        ] {
+            assert!(!holds_on_any_host(host_only), "{host_only}");
+        }
+    }
 
     fn charged_analysis(signals: &[&str], recommendation: &str) -> CommandAnalysis {
         CommandAnalysis {

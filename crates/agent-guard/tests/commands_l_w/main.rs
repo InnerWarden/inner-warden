@@ -29,6 +29,7 @@ mod shell_runner_forms;
 mod shell_small_edges;
 mod sql_text_is_data;
 mod sql_through_container_and_ssh;
+mod ssh_client_and_remote_line;
 mod stdin_to_shell_is_script;
 mod substitution_is_a_program_in_any_slot;
 mod text_a_later_step_runs;

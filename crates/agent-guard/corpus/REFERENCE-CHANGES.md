@@ -604,3 +604,32 @@ harmless. A malicious or `must_refuse` line cannot be waived here.
   mcp-sessions/mcps-104
   goes from deny to allow for the reason above: a session token a login
   returned, sent back to the server that issued it.
+- 2026-11-27: ssh-client-2026-11 is new. The ssh client's own words are
+  its use, not a read: the settings it reads (`~/.ssh/config` and the
+  files of `~/.ssh/config.d`, named plainly, as a word of a command or as
+  `-F` of `ssh`, `scp` or `sftp`) hold no secret, and the key of an
+  `rsync -e` transport given through a variable the line does not set
+  (`ssh -i $HOME/.ssh/id_k`) is the key the client signs in with
+  (`shell::ssh_client::secret_reading`). The line `ssh` runs on another
+  host is read for a secret as a line of its own, never as words of the
+  `ssh` command around it, and is judged in `mcp` for what holds on any
+  host (a removal, a secret read, a download run, the guard taken down),
+  not for this host's own files and settings. `cat` handed only public
+  SSH files prints no path, also inside a substitution. An `ssh` fed on
+  its input, inside a substitution that is not the whole value of a
+  variable, or whose options or destination hold a variable the line sets
+  or that stands alone (`$PORT`, `$OPTS`, `u@$HOST`) is read as written,
+  as before. Writing the settings stays refused. ssc-102,
+  ssc-105, ssc-106 and ssc-109 go from allow to a stop: a private key
+  opened by `ssh-keygen` in a loop on the other host, a download piped to a
+  shell there (in the default posture as here, refused as a high-certainty
+  finding), and everything removed there. The ssc-1NN lines are
+  must_refuse, held by `tests/commands_l_w/ssh_client_and_remote_line.rs`.
+  Against main no line of any other corpus moved, in the empty home and
+  in the home with keys.
+  harmless-proven:
+  ssh-client-2026-11/ssc-001 ssh-client-2026-11/ssc-002 ssh-client-2026-11/ssc-003 ssh-client-2026-11/ssc-004 ssh-client-2026-11/ssc-005 ssh-client-2026-11/ssc-006 ssh-client-2026-11/ssc-007 ssh-client-2026-11/ssc-009 ssh-client-2026-11/ssc-010 ssh-client-2026-11/ssc-011
+  go from deny to allow for the reason above: the client's settings read,
+  a key used by the client, public files or settings read on the other
+  host, a remote line whose output is held in a variable, and a public key
+  printed by `cat` into a value.
