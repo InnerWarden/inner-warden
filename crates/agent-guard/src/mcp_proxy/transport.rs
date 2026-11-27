@@ -2766,6 +2766,43 @@ mod tests {
         assert_eq!(out.as_deref(), Some(clean.as_str()));
     }
 
+    /// Every answer of a batch read only in part is cut: two of them as
+    /// well as one.
+    #[test]
+    fn every_answer_of_a_batch_past_the_scan_is_cut() {
+        let long = "word ".repeat(16 * 1024);
+        let answer = |id: u32| serde_json::json!({"jsonrpc": "2.0", "id": id, "result": {"content": [{"type": "text", "text": long}]}});
+        for ids in [vec![9], vec![9, 10]] {
+            let mut m = IdRequestMap::new();
+            for id in &ids {
+                m.insert(
+                    id.to_string(),
+                    PendingRequest {
+                        method: "tools/call".into(),
+                        tool: Some("fetch".into()),
+                    },
+                );
+            }
+            let batch =
+                Value::Array(ids.iter().map(|id| answer(*id)).collect::<Vec<_>>()).to_string();
+            let ServerAction::ForwardBatch { raw, .. } = classify_server_line_in(
+                &batch,
+                ProxyMode::Guard,
+                None,
+                &mut m,
+                &mut TaintTracker::new(),
+            ) else {
+                panic!("a batch is forwarded as a batch");
+            };
+            assert!(raw.len() < batch.len(), "{ids:?}: the batch went on whole");
+            let items: Value = serde_json::from_str(&raw).expect("json");
+            for item in items.as_array().expect("a batch") {
+                let text = item["result"]["content"][0]["text"].as_str().expect("text");
+                assert!(text.len() < long.len(), "{ids:?}");
+            }
+        }
+    }
+
     /// A prompt or a completion that carries orders for the model is held
     /// back whole in a mode that blocks, the error keyed to its id; a
     /// request the server makes (a message for the model to complete) with

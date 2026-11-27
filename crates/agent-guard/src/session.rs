@@ -174,6 +174,26 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_url_starts_with_either_scheme() {
+        for value in ["http://a.io", "https://a.io/x", "HTTPS://A.IO"] {
+            assert!(is_url(value), "{value}");
+        }
+        for value in ["ftp://a.io", "a.io", "http:/a.io", ""] {
+            assert!(!is_url(value), "{value}");
+        }
+    }
+
+    #[test]
+    fn a_destination_is_kept_from_its_eighth_byte() {
+        let key = [7u8; DESTINATION_HASH_BYTES];
+        let places = destination_places(&key, "curl http://a.io/x");
+        let kept: std::collections::HashSet<&str> = places.values().copied().collect();
+        assert!(kept.contains("http://a"), "{kept:?}");
+        assert!(kept.contains("http://a.io/x"), "{kept:?}");
+        assert!(!kept.contains("http://"), "{kept:?}");
+    }
+
+    #[test]
     fn a_notable_rate_raises_an_alert() {
         let mut s = SessionTracker::new();
         for _ in 0..=NOTABLE_CALLS_PER_MINUTE {

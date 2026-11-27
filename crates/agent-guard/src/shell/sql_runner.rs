@@ -439,4 +439,58 @@ mod tests {
             assert_eq!(ssh_command_start(&words(line)), start, "{line}");
         }
     }
+
+    #[test]
+    fn a_container_runner_needs_a_program_after_the_container() {
+        assert_eq!(container_exec_program(&words("exec db psql")), Some(2));
+        assert_eq!(container_exec_program(&words("exec db")), None);
+        assert_eq!(container_exec_program(&words("exec -it db")), None);
+    }
+
+    #[test]
+    fn kubectl_names_the_pod_only_after_exec() {
+        assert_eq!(kubectl_exec_program(&words("exec pg-0 -- psql")), Some(3));
+        assert_eq!(kubectl_exec_program(&words("pg-0 exec -- psql")), None);
+    }
+
+    #[test]
+    fn runners_are_read_only_so_deep() {
+        let four = "docker exec a docker exec b docker exec c docker exec d psql";
+        assert_eq!(
+            sql_client_at(&words(four), 0),
+            Some(("psql".to_owned(), 12))
+        );
+        let five = "docker exec a docker exec b docker exec c docker exec d docker exec e psql";
+        assert_eq!(sql_client_at(&words(five), 0), None);
+    }
+
+    #[test]
+    fn unquoted_bytes_map_back_to_where_they_were_written() {
+        let mut out = Vec::new();
+        let mut map = Vec::new();
+        assert_eq!(
+            unquote_mapped(b"x'ab'\\c", 10, &mut out, &mut map),
+            Some(())
+        );
+        assert_eq!(out, b"xabc");
+        assert_eq!(map, vec![Some(10), Some(12), Some(13), Some(16)]);
+    }
+
+    #[test]
+    fn only_a_line_that_runs_a_sql_client_gives_one() {
+        assert_eq!(
+            line_sql_client("psql -d app -c 'select 1'"),
+            Some((
+                "psql".to_owned(),
+                vec![
+                    "-d".to_owned(),
+                    "app".to_owned(),
+                    "-c".to_owned(),
+                    "select 1".to_owned()
+                ]
+            ))
+        );
+        assert_eq!(line_sql_client("echo psql"), None);
+        assert_eq!(line_sql_client("psql $X"), None);
+    }
 }

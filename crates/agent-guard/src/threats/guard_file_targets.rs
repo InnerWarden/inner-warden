@@ -971,4 +971,76 @@ mod tests {
             assert!(!removal_reaches_guard_file(line), "{line}");
         }
     }
+
+    fn plain_words(line: &str) -> Vec<Word> {
+        line.split(' ').map(plain_word).collect()
+    }
+
+    fn operand_texts(program: &str, line: &str) -> Option<(Vec<String>, bool)> {
+        removal_operands(program, &plain_words(line))
+            .map(|(operands, whole)| (operands.into_iter().map(|word| word.text).collect(), whole))
+    }
+
+    #[test]
+    fn long_options_of_a_removal_are_read_by_name() {
+        assert_eq!(
+            operand_texts("rm", "--recursive --recursive dir"),
+            Some((vec!["dir".to_owned()], true))
+        );
+        assert_eq!(
+            operand_texts("ln", "--force --symbolic /dev/null unit"),
+            Some((vec!["unit".to_owned()], false))
+        );
+        assert_eq!(operand_texts("ln", "--symbolic /dev/null unit"), None);
+        assert_eq!(
+            operand_texts("truncate", "--size 0 file"),
+            Some((vec!["file".to_owned()], false))
+        );
+        assert_eq!(
+            operand_texts("truncate", "--reference other file"),
+            Some((vec!["file".to_owned()], false))
+        );
+    }
+
+    #[test]
+    fn an_assignment_names_a_variable() {
+        for word in ["a=1", "_A1=x", "HOME=", "a_1=1"] {
+            assert!(is_assignment(word), "{word}");
+        }
+        for word in ["=x", "1a=1", "a-b=1", "a.b=1", "1=1", "a"] {
+            assert!(!is_assignment(word), "{word}");
+        }
+    }
+
+    fn read_value(line: &str, input: &str) -> Option<Option<String>> {
+        read_gives_home(&plain_words(line), Some(input)).map(|value| value.map(|word| word.text))
+    }
+
+    #[test]
+    fn read_gives_home_the_field_its_name_takes() {
+        // An option with its value in the next word: the value is no name.
+        assert_eq!(
+            read_value("-p prompt HOME", "/tmp/x y"),
+            Some(Some("/tmp/x y".to_owned()))
+        );
+        // An array takes the fields, its first is the home.
+        assert_eq!(
+            read_value("-a HOME", "/tmp/x y"),
+            Some(Some("/tmp/x".to_owned()))
+        );
+        // The last name takes the rest of the line, another name one field.
+        assert_eq!(
+            read_value("A HOME", "a /tmp/x y"),
+            Some(Some("/tmp/x y".to_owned()))
+        );
+        assert_eq!(
+            read_value("HOME A", "/tmp/x y"),
+            Some(Some("/tmp/x".to_owned()))
+        );
+        assert_eq!(
+            read_value("HOME", "/tmp/x y"),
+            Some(Some("/tmp/x y".to_owned()))
+        );
+        assert_eq!(read_value("-p HOME A", "/tmp/x"), None);
+    }
 }

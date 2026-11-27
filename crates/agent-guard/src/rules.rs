@@ -1707,6 +1707,22 @@ mod tests {
     use super::*;
     use std::io::Write;
 
+    #[test]
+    fn an_atr_document_is_told_by_any_one_of_its_marks() {
+        let document = |text: &str| serde_yaml::from_str::<serde_yaml::Value>(text).expect("yaml");
+        for text in [
+            "id: ATR-2025-0001\ntitle: x\n",
+            "id: ' atr-1'\n",
+            "agent_source: x\n",
+            "detection_tier: 1\n",
+        ] {
+            assert!(is_atr_document(&document(text)), "{text}");
+        }
+        for text in ["id: custom-1\n", "title: ATR-1\n", "id: 7\n"] {
+            assert!(!is_atr_document(&document(text)), "{text}");
+        }
+    }
+
     fn sample_yaml() -> &'static str {
         r#"
 title: "Test Prompt Injection"

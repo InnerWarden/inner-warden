@@ -2457,3 +2457,30 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod folder_tests {
+    use super::*;
+
+    fn folders(line: &str, cwd: &str) -> LineFolders {
+        let tree = parse_bash(line).expect("a shell line");
+        line_folders(tree.root_node(), line.as_bytes(), Some(cwd))
+    }
+
+    #[test]
+    fn the_home_alone_is_a_folder() {
+        assert_eq!(resolved_path("~").as_deref(), Some("~/"));
+        assert_eq!(resolved_path("$HOME").as_deref(), Some("~/"));
+        assert_eq!(resolved_path("~/a/../b").as_deref(), Some("~/b"));
+        assert_eq!(resolved_path("x"), None);
+    }
+
+    #[test]
+    fn only_popd_leaves_the_folder_unknown() {
+        let read = folders("cd /tmp && ls -la", "/work");
+        assert!(!read.unknown);
+        assert_eq!(read.known, vec!["/work".to_owned(), "/tmp".to_owned()]);
+        assert!(folders("cd /tmp && popd", "/work").unknown);
+        assert!(folders("cd /tmp; sudo popd", "/work").unknown);
+    }
+}

@@ -6858,6 +6858,64 @@ fn check_shell_internal_target(command: &str) -> Option<String> {
 mod tests {
     use super::*;
 
+    fn charged_analysis(signals: &[&str], recommendation: &str) -> CommandAnalysis {
+        CommandAnalysis {
+            command: "as written".into(),
+            risk_score: 0,
+            severity: String::new(),
+            signals: signals
+                .iter()
+                .map(|signal| AnalysisSignal {
+                    signal: (*signal).into(),
+                    score: 40,
+                    detail: String::new(),
+                })
+                .collect(),
+            recommendation: recommendation.into(),
+            explanation: String::new(),
+            atr_matches: Vec::new(),
+            asi_ids: Vec::new(),
+        }
+    }
+
+    const CAT_NOTES: &str =
+        "cat <<'EOF' > NOTES.md\nnode -e can writeFileSync the .claude/settings.json file\nEOF";
+
+    /// The notes' reading is taken only when all it drops is the takedown
+    /// and it finds nothing new.
+    #[test]
+    fn cat_notes_are_read_as_text_only_when_that_drops_the_takedown_alone() {
+        let as_written = || charged_analysis(&["guard_self_disable", "secret_x"], "deny");
+        let lowered = cat_notes_as_text(CAT_NOTES, as_written(), |_| {
+            charged_analysis(&["secret_x"], "review")
+        });
+        assert_eq!(lowered.recommendation, "review");
+        assert_eq!(lowered.command, "as written");
+        // Still a takedown with the notes blanked: the line as written.
+        let kept = cat_notes_as_text(CAT_NOTES, as_written(), |_| {
+            charged_analysis(&["guard_self_disable"], "review")
+        });
+        assert_eq!(kept.recommendation, "deny");
+        // A finding the line as written did not have: the line as written.
+        let kept = cat_notes_as_text(CAT_NOTES, as_written(), |_| {
+            charged_analysis(&["secret_x", "new_y"], "review")
+        });
+        assert_eq!(kept.recommendation, "deny");
+        // A finding dropped besides the takedown: the line as written.
+        let kept = cat_notes_as_text(CAT_NOTES, as_written(), |_| charged_analysis(&[], "allow"));
+        assert_eq!(kept.recommendation, "deny");
+    }
+
+    /// A name that starts with an underscore is a name the spelled-out line
+    /// may set.
+    #[test]
+    fn names_set_when_spelled_out_may_start_with_an_underscore() {
+        assert!(names_set_only_when_spelled_out("export {HO,}ME=/etc; rm -rf $HOME/x").is_some());
+        assert!(
+            names_set_only_when_spelled_out("export {_GU,}ARD=/etc; rm -rf $_GUARD/x").is_some()
+        );
+    }
+
     /// The running guard's own path is read by its text, never resolved
     /// in the guard's process: a path the shell resolves in its own
     /// working folder (`/proc/self/cwd/`, `/dev/fd/../cwd/`) or through a

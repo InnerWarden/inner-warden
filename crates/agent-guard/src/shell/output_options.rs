@@ -542,4 +542,18 @@ mod tests {
             assert!(stream.is_some_and(|s| s.injects), "{line}");
         }
     }
+
+    #[test]
+    fn a_quoted_target_after_cd_is_read_without_its_quotes() {
+        // An empty name is no file in the folder `cd` moved to.
+        assert_eq!(
+            writes_into_another_process("cd /proc/4242/fd/0 && echo x > ''"),
+            None
+        );
+        assert_eq!(
+            writes_into_another_process("cd /proc/4242/fd/0 && echo x > \"\""),
+            None
+        );
+        assert!(writes_into_another_process("cd /proc/4242 && echo x > fd/0").is_some());
+    }
 }

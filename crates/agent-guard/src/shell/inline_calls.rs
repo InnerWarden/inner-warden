@@ -6128,6 +6128,26 @@ fn rendered_word(value: &Value) -> String {
 mod tests {
     use super::*;
 
+    #[test]
+    fn brackets_after_a_value_are_a_call_not_a_name_alone() {
+        assert_eq!(lua_builtin_spellings("f(load)"), "f(load)");
+        assert_eq!(lua_builtin_spellings("t[1](load)"), "t[1](load)");
+        assert_eq!(lua_builtin_spellings("(load)('x')"), "load('x')");
+        assert_eq!(lua_builtin_spellings("x = (load)('x')"), "x = load('x')");
+    }
+
+    #[test]
+    fn a_name_inside_a_string_is_left_as_written() {
+        assert_eq!(
+            lua_name_written_as("'a load' load", "load", "X", true),
+            "'a load' X"
+        );
+        assert_eq!(
+            lua_name_written_as("x = \"load\"; load", "load", "X", true),
+            "x = \"load\"; X"
+        );
+    }
+
     fn read(lang: Lang, code: &str) -> InlineReading {
         read_code(lang, code, CODE_DEPTH)
     }
