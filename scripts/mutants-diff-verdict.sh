@@ -49,7 +49,7 @@ case "$code" in
     summary "tested $tested of $planned, no survivor"
     exit 0 ;;
   2)
-    echo "::error::A mutant survived in code changed since yesterday: the tests do not check that line. See the uploaded report."
+    echo "::error::A mutant survived in the changed code: the tests do not check that line. See the uploaded report."
     summary "tested $tested of $planned, $missed survived"
     exit 1 ;;
   3)
@@ -62,7 +62,7 @@ case "$code" in
     exit 1 ;;
   124|137)
     if [ "$missed" -gt 0 ]; then
-      echo "::error::A mutant survived in code changed since yesterday: the tests do not check that line. See the uploaded report. (The shard budget also ran out: tested $tested of $planned.)"
+      echo "::error::A mutant survived in the changed code: the tests do not check that line. See the uploaded report. (The shard budget also ran out: tested $tested of $planned.)"
       summary "tested $tested of $planned before the budget ran out, $missed survived"
       exit 1
     fi
@@ -76,7 +76,7 @@ case "$code" in
       summary "tested 0 of $planned: the budget ran out before the baseline finished"
       exit 0
     fi
-    echo "::warning::$label: tested $tested of $planned mutants before the budget ran out; none of them survived. The other $((planned - tested)) were not tested tonight."
+    echo "::warning::$label: tested $tested of $planned mutants before the budget ran out; none of them survived. The other $((planned - tested)) were not tested in this run."
     summary "tested $tested of $planned before the budget ran out, no survivor among them"
     exit 0 ;;
   *)
