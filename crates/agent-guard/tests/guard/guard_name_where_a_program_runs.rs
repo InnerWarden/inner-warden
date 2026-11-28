@@ -455,16 +455,25 @@ fn a_read_of_the_guards_store_is_charged_once_with_its_reason() {
             })
             .collect();
         assert_eq!(charged.len(), 1, "{line}: {:?}", analysis.signals);
-    } // Any other tamper finding of the remote line stands there and in the
-      // line read whole.
+    } // Any other tamper finding of the remote line stands there, read as
+      // the line it is, and is charged once: the line around it does not
+      // read the remote words again as text.
     let line = "ssh h1 'pkill -f innerwarden'";
     let analysis = analyze_command(line, None);
-    let tampers = analysis
+    let tampers: Vec<_> = analysis
         .signals
         .iter()
         .filter(|signal| signal.signal == "security_tooling_tamper")
-        .count();
-    assert_eq!(tampers, 2, "{line}: {:?}", analysis.signals);
+        .collect();
+    assert_eq!(tampers.len(), 1, "{line}: {:?}", analysis.signals);
+    assert!(
+        tampers[0]
+            .detail
+            .starts_with("in the line ssh runs on another host"),
+        "{line}: {:?}",
+        analysis.signals
+    );
+    assert_eq!(analysis.recommendation, "deny", "{line}");
     // A store read on this host is charged even where the remote line was
     // charged for another finding: only the same read is charged once.
     let line = "ssh h1 'pkill -f proxy'; cat /var/lib/innerwarden/d.jsonl";

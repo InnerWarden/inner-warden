@@ -18,8 +18,8 @@ mod sql_text;
 mod ssh_client;
 mod unread_parts;
 
-pub(crate) use inline_calls::InlineReading;
-pub(crate) use sql_runner::ssh_remote_lines;
+pub(crate) use inline_calls::{line_may_run_a_written_file_for_the_guard, InlineReading};
+pub(crate) use sql_runner::{ssh_remote_lines, ssh_remote_words_blanked};
 pub(crate) use ssh_client::{client_reading, private_key_opened};
 pub(crate) use unread_parts::unread_part;
 
@@ -42,6 +42,14 @@ pub(crate) struct ShellProjection {
     /// The line calls more functions defined on it than the guard writes
     /// out ([`FUNCTION_CALLS_WRITTEN_OUT`]): what they run is unread.
     pub(crate) names_over_budget: bool,
+    /// [`Self::scan`] with the text a program that runs none of it is
+    /// handed masked as well ([`mask_text_arguments_for_the_guard`]): what
+    /// the guard's own checks read.
+    pub(crate) guard_scan: String,
+    /// [`Self::masks_in_doubt`] as the guard's own checks read it
+    /// ([`masks_are_in_doubt_for_the_guard`]): only where a command of the
+    /// line may take away the trust the masks give a name.
+    pub(crate) guard_masks_in_doubt: bool,
 }
 
 pub(crate) fn project(source: &str) -> ShellProjection {
@@ -60,9 +68,11 @@ pub(crate) fn project(source: &str) -> ShellProjection {
     let Some(tree) = parse_bash(text) else {
         return ShellProjection {
             scan: source.to_owned(),
+            guard_scan: source.to_owned(),
             parsed: false,
             masks_in_doubt: false,
             names_over_budget,
+            guard_masks_in_doubt: false,
         };
     };
     if tree.root_node().has_error() {
@@ -70,9 +80,11 @@ pub(crate) fn project(source: &str) -> ShellProjection {
         // Callers can also surface the parse ambiguity as a review signal.
         return ShellProjection {
             scan: source.to_owned(),
+            guard_scan: source.to_owned(),
             parsed: false,
             masks_in_doubt: false,
             names_over_budget,
+            guard_masks_in_doubt: false,
         };
     }
     if ast_exceeds_projection_budget(tree.root_node()) {
@@ -81,13 +93,16 @@ pub(crate) fn project(source: &str) -> ShellProjection {
         // avoids turning a recursion guard into a detection bypass.
         return ShellProjection {
             scan: source.to_owned(),
+            guard_scan: source.to_owned(),
             parsed: false,
             masks_in_doubt: false,
             names_over_budget,
+            guard_masks_in_doubt: false,
         };
     }
 
     let mut masked = Vec::new();
+    let mut guard_masked = Vec::new();
     let mut executable_inside_mask = Vec::new();
     let mut unreachable = Vec::new();
     collect_literal_unreachable_ranges(tree.root_node(), text.as_bytes(), &mut unreachable, 0);
@@ -97,63 +112,159 @@ pub(crate) fn project(source: &str) -> ShellProjection {
         text.as_bytes(),
         &taint,
         &mut masked,
+        &mut guard_masked,
         &mut executable_inside_mask,
         0,
     );
-
-    let mut hide = vec![false; text.len()];
-    for range in masked {
-        for slot in hide
-            .get_mut(range)
-            .into_iter()
-            .flat_map(|slice| slice.iter_mut())
-        {
-            *slot = true;
+    let hidden = |extra: &[Range<usize>]| {
+        let mut hide = vec![false; text.len()];
+        for range in masked.iter().chain(extra) {
+            for slot in hide
+                .get_mut(range.clone())
+                .into_iter()
+                .flat_map(|slice| slice.iter_mut())
+            {
+                *slot = true;
+            }
         }
-    }
-    // `echo "$(dangerous-command)"` still executes the substitution.  Restore
-    // those AST ranges after masking their surrounding literal argument.
-    for range in executable_inside_mask {
-        for slot in hide
-            .get_mut(range)
-            .into_iter()
-            .flat_map(|slice| slice.iter_mut())
-        {
-            *slot = false;
+        // `echo "$(dangerous-command)"` still executes the substitution.
+        // Restore those AST ranges after masking their surrounding literal
+        // argument.
+        for range in &executable_inside_mask {
+            for slot in hide
+                .get_mut(range.clone())
+                .into_iter()
+                .flat_map(|slice| slice.iter_mut())
+            {
+                *slot = false;
+            }
         }
-    }
-    // Literal `true`/`false` branches are statically unreachable. Apply these
-    // masks after restoring executable substitutions so code nested inside a
-    // dead branch cannot leak back into the scan.
-    for range in unreachable {
-        for slot in hide
-            .get_mut(range)
-            .into_iter()
-            .flat_map(|slice| slice.iter_mut())
-        {
-            *slot = true;
+        // Literal `true`/`false` branches are statically unreachable. Apply
+        // these masks after restoring executable substitutions so code
+        // nested inside a dead branch cannot leak back into the scan.
+        for range in &unreachable {
+            for slot in hide
+                .get_mut(range.clone())
+                .into_iter()
+                .flat_map(|slice| slice.iter_mut())
+            {
+                *slot = true;
+            }
         }
-    }
-
-    let mut bytes = text.as_bytes().to_vec();
-    for (index, byte) in bytes.iter_mut().enumerate() {
-        if hide[index] && *byte != b'\n' && *byte != b'\r' {
-            *byte = b' ';
+        let mut bytes = text.as_bytes().to_vec();
+        for (index, byte) in bytes.iter_mut().enumerate() {
+            if hide[index] && *byte != b'\n' && *byte != b'\r' {
+                *byte = b' ';
+            }
         }
-    }
+        // Replacing bytes with ASCII spaces preserves UTF-8 boundaries
+        // because every byte in a masked multibyte codepoint is replaced.
+        String::from_utf8(bytes).unwrap_or_else(|_| source.to_owned())
+    };
+    let scan = hidden(&[]);
+    let guard_scan = if guard_masked.is_empty() {
+        scan.clone()
+    } else {
+        hidden(&guard_masked)
+    };
     ShellProjection {
-        // Replacing bytes with ASCII spaces preserves UTF-8 boundaries because
-        // every byte in a masked multibyte codepoint is replaced.
-        scan: String::from_utf8(bytes).unwrap_or_else(|_| source.to_owned()),
+        scan,
+        guard_scan,
         parsed: true,
         masks_in_doubt: masks_are_in_doubt(tree.root_node(), text),
         names_over_budget,
+        guard_masks_in_doubt: masks_are_in_doubt_for_the_guard(tree.root_node(), text),
     }
 }
 
 /// Whether `inner` lies within `outer`, by bytes.
 fn within(inner: tree_sitter::Node<'_>, outer: tree_sitter::Node<'_>) -> bool {
     outer.start_byte() <= inner.start_byte() && inner.end_byte() <= outer.end_byte()
+}
+
+/// The programs whose words, or whose input, the masks take for data by
+/// their name ([`mask_literal_command_args`], [`mask_data_heredoc`]).
+const MASKED_BY_NAME: &[&str] = &[
+    "echo", "printf", "grep", "egrep", "fgrep", "rg", "ripgrep", "sed", "jq", "yq", "git", "curl",
+    "gh", "glab", "cat", "tee",
+];
+
+/// [`masks_are_in_doubt`] for the guard's own checks: whether a command of
+/// the line may take away the trust the masks give a NAME (`cat` only
+/// reads, `echo` prints). A function the line defines, a builtin that
+/// rebinds a name, the search path changed, a name the shell composes, and a
+/// program run by a path whose last part is a name the masks trust
+/// (`/tmp/x/cat`) do. An interpreter or a shell elsewhere on the line, or
+/// another program run by its path, does not: the masks keep what a command
+/// runs in view (a body an interpreter reads, a file the line writes and
+/// runs, output piped to a shell), and what they hide is text no command of
+/// the line runs. Measured 2026-11-28 on a week of an operator's own work:
+/// the doubt was taken on 190 of the 197 lines the guard refused for text
+/// that only speaks of it, from a `python3` or a `./tool` beside a
+/// here-document handed to `cat`.
+fn masks_are_in_doubt_for_the_guard(root: tree_sitter::Node<'_>, text: &str) -> bool {
+    if DOUBT_MARKS.iter().any(|mark| text.contains(mark))
+        || node_contains_kind(root, "function_definition", 0)
+    {
+        return true;
+    }
+    let source = text.as_bytes();
+    // What a process substitution prints, handed to a program that runs
+    // text (`ssh db psql < <(echo '\! x')`, `bash <(printf ...)`): the
+    // masks read that text as data of the program that prints it.
+    let mut substitutions = Vec::new();
+    collect_nodes_of_kind(root, "process_substitution", &mut substitutions, 0);
+    let fed_to_a_runner = substitutions.into_iter().any(|substitution| {
+        let mut at = substitution.parent();
+        while let Some(node) = at {
+            let consumer = match node.kind() {
+                "command" => Some(node),
+                "redirected_statement" => node
+                    .child_by_field_name("body")
+                    .filter(|body| body.kind() == "command"),
+                _ => None,
+            };
+            if let Some(command) = consumer {
+                return command_name(command, source).is_none_or(|name| {
+                    let program = normalized_command_name(&name);
+                    runs_text(&program)
+                        || is_execution_sink(&program)
+                        || sql_runner::runs_sql_client(command, source)
+                });
+            }
+            at = node.parent();
+        }
+        false
+    });
+    if fed_to_a_runner {
+        return true;
+    }
+    let rebinds =
+        |word: &str| NAME_REBINDING_BUILTINS.contains(&normalized_command_name(word).as_str());
+    let mut commands = Vec::new();
+    collect_all_commands(root, &mut commands, 0);
+    commands.into_iter().any(|command| {
+        let Some(name) = command_name(command, source) else {
+            return false;
+        };
+        if name.contains(['$', '`', '{']) || rebinds(&name) {
+            return true;
+        }
+        let mut cursor = command.walk();
+        if command
+            .children_by_field_name("argument", &mut cursor)
+            .any(|argument| argument.utf8_text(source).is_ok_and(rebinds))
+        {
+            return true;
+        }
+        let program = normalized_command_name(&name);
+        name.contains('/')
+            && (MASKED_BY_NAME.contains(&program.as_str())
+                || ["python", "node", "ruby", "perl"]
+                    .iter()
+                    .any(|interpreter| program.starts_with(interpreter))
+                || sql_runner::runs_sql_client(command, source))
+    })
 }
 
 /// Builtins that give a name another meaning with no file at all: an alias,
@@ -3093,16 +3204,29 @@ pub(crate) fn inline_code_reading(source: &str) -> InlineReading {
             // Its strings are blanked in the line only where the line holds
             // the code as the program reads it.
             if code == as_written {
-                if let Some(blanked) = inline_calls::data_literals_blanked(lang, &code, &piece) {
-                    piece.data_blanked.push((as_written, blanked));
+                if let Some(blanked) = inline_calls::data_literals_blanked(
+                    lang,
+                    &code,
+                    &piece,
+                    inline_calls::Places::Whole,
+                ) {
+                    piece.data_blanked.push((as_written.clone(), blanked));
+                }
+                if let Some(blanked) = inline_calls::data_literals_blanked(
+                    lang,
+                    &code,
+                    &piece,
+                    inline_calls::Places::Kept,
+                ) {
+                    piece.guard_blanked.push((as_written, blanked));
                 }
             }
             reading.merge(piece);
         }
     }
-    reading
-        .data_blanked
-        .extend(shell_heredoc_data_blanked(source));
+    let shell_data = shell_heredoc_data_blanked(source);
+    reading.guard_blanked.extend(shell_data.iter().cloned());
+    reading.data_blanked.extend(shell_data);
     // What the code prints may reach a command: piped on, or written to a
     // file on a line that runs more (`perl -e 'print q{...}' > x.sh && sh
     // x.sh`). Its strings are then read as the line holds them.
@@ -3110,6 +3234,19 @@ pub(crate) fn inline_code_reading(source: &str) -> InlineReading {
     // the code wrote (`ruby -e 'File.write("x.sh", ...)' && sh x.sh`).
     if code_output_reaches_a_command(source) || inline_calls::line_may_run_a_written_file(source) {
         reading.data_blanked.clear();
+    }
+    if code_output_reaches_a_command(source)
+        || inline_calls::line_may_run_a_written_file_for_the_guard(
+            source,
+            &reading
+                .written
+                .iter()
+                .map(|(path, _)| path.clone())
+                .collect::<Vec<_>>(),
+            !reading.code.is_empty(),
+        )
+    {
+        reading.guard_blanked.clear();
     }
     reading
 }
@@ -3416,16 +3553,29 @@ fn echo_lines_blanked(body: &str, source: &str) -> String {
 /// lines its calls run are judged in their own place. `None` when the
 /// reading leaves anything unread, or no such piece stands in `scan`.
 pub(crate) fn with_inline_data_blanked(scan: &str, reading: &InlineReading) -> Option<String> {
-    if reading.unread
-        || reading.code_unread
-        || reading.runs_download
-        || reading.data_blanked.is_empty()
-    {
+    pieces_replaced(scan, reading, &reading.data_blanked)
+}
+
+/// The text `text` as the guard's own checks read it: the strings of its
+/// inline code taken out where they are only text the code edits or prints
+/// ([`InlineReading::guard_blanked`]), a string that may name a file kept.
+/// `None` where nothing is taken out.
+pub(crate) fn with_inline_guard_blanked(text: &str, reading: &InlineReading) -> Option<String> {
+    pieces_replaced(text, reading, &reading.guard_blanked)
+}
+
+/// `text` with each piece of code as written replaced by its blanked form.
+fn pieces_replaced(
+    text: &str,
+    reading: &InlineReading,
+    pieces: &[(String, String)],
+) -> Option<String> {
+    if reading.unread || reading.code_unread || reading.runs_download || pieces.is_empty() {
         return None;
     }
-    let mut out = scan.to_owned();
+    let mut out = text.to_owned();
     let mut changed = false;
-    for (as_written, blanked) in &reading.data_blanked {
+    for (as_written, blanked) in pieces {
         if as_written != blanked && out.contains(as_written.as_str()) {
             out = out.replace(as_written.as_str(), blanked);
             changed = true;
@@ -13405,6 +13555,12 @@ fn python_code_input(args: &[String]) -> CodeInput {
         if argument == "-c" {
             return next_code_argument(args, index);
         }
+        // A lone `-` is the program read from the standard input; the words
+        // after it are the program's own (`python3 - notes.txt <<'EOF'`).
+        // Read as an option, it made the next word the code.
+        if argument == "-" {
+            return CodeInput::Stdin;
+        }
         // A group of short flags is read flag by flag (`-uc CODE`,
         // `-Bc CODE`, `-ucCODE`): `-c` takes the rest of the group or the
         // next word as code, `-m` a module, and `-W` or `-X` the rest of
@@ -13854,6 +14010,7 @@ fn collect_ranges(
     source: &[u8],
     taint: &LineTaint,
     masked: &mut Vec<Range<usize>>,
+    guard_masked: &mut Vec<Range<usize>>,
     executable_inside_mask: &mut Vec<Range<usize>>,
     depth: u8,
 ) {
@@ -13864,6 +14021,13 @@ fn collect_ranges(
         "comment" if comment_opens_a_word(node, source) => masked.push(node.byte_range()),
         "command" => {
             mask_literal_command_args(node, source, taint, masked, executable_inside_mask);
+            mask_text_arguments_for_the_guard(
+                node,
+                source,
+                taint,
+                guard_masked,
+                executable_inside_mask,
+            );
         }
         "heredoc_body" => mask_data_heredoc(node, source, masked, executable_inside_mask),
         "herestring_redirect" => {
@@ -13880,6 +14044,7 @@ fn collect_ranges(
                 source,
                 taint,
                 masked,
+                guard_masked,
                 executable_inside_mask,
                 depth + 1,
             );
@@ -13903,6 +14068,445 @@ fn comment_opens_a_word(node: tree_sitter::Node<'_>, source: &[u8]) -> bool {
         .checked_sub(1)
         .and_then(|before| source.get(before))
         .is_none_or(|byte| matches!(byte, b' ' | b'\t' | b'\n'))
+}
+
+/// Programs that run text they are handed, besides the shells, the
+/// interpreters and the launchers of the table ([`runners::program`]): by an
+/// option (`git -c`, `tar --checkpoint-action`, `vim -c`, `osascript -e`,
+/// `psql -c '\\!'`), as a prompt an agent acts on, or as a command of their
+/// own (`tmux send-keys`, `docker exec`). Their words stay in view for the
+/// guard's own checks.
+const RUNS_TEXT: &[&str] = &[
+    "ssh",
+    "git",
+    "awk",
+    "gawk",
+    "mawk",
+    "nawk",
+    "sed",
+    "gsed",
+    "find",
+    "fd",
+    "fdfind",
+    "tar",
+    "zip",
+    "rsync",
+    "scp",
+    "sftp",
+    "vim",
+    "nvim",
+    "vi",
+    "ex",
+    "view",
+    "emacs",
+    "less",
+    "more",
+    "man",
+    "osascript",
+    "tmux",
+    "screen",
+    "docker",
+    "podman",
+    "kubectl",
+    "nerdctl",
+    "oc",
+    "lxc",
+    "make",
+    "gmake",
+    "npm",
+    "npx",
+    "pnpm",
+    "pnpx",
+    "yarn",
+    "bun",
+    "bunx",
+    "deno",
+    "cargo",
+    "gh",
+    "glab",
+    "crontab",
+    "at",
+    "batch",
+    "systemd-run",
+    "sudo",
+    "doas",
+    "su",
+    "runuser",
+    "sg",
+    "script",
+    "expect",
+    "gdb",
+    "lldb",
+    "xterm",
+    "watch",
+    "parallel",
+    "xargs",
+    "env",
+    "exec",
+    "eval",
+    "source",
+    ".",
+    "time",
+    "nohup",
+    "timeout",
+    "nice",
+    "ionice",
+    "chroot",
+    "unshare",
+    "nsenter",
+    "flock",
+    "setsid",
+    "stdbuf",
+    "taskset",
+    "busybox",
+    "toybox",
+    "psql",
+    "mysql",
+    "mariadb",
+    "sqlite3",
+    "duckdb",
+    "clickhouse-client",
+    "cqlsh",
+    "redis-cli",
+    "mongo",
+    "mongosh",
+    "pwsh",
+    "powershell",
+    "cmd",
+    "r",
+    "rscript",
+    "julia",
+    "tclsh",
+    "wish",
+    "claude",
+    "codex",
+    "gemini",
+    "aider",
+    "goose",
+    "cursor-agent",
+    "opencode",
+    "openclaw",
+    "hermes",
+    "amp",
+    "qwen",
+    "copilot",
+    "trap",
+    "command",
+    "builtin",
+    "uvx",
+    "pipx",
+    "just",
+    "task",
+];
+
+/// Programs whose words name what they act on: a process a pattern finds
+/// (`pkill -f 'hook --agent x'`), a unit, a file, a device, a host's
+/// settings. Their words stay in view for the guard's own checks whatever
+/// they hold; only a program the guard does not know (a script or a tool
+/// of the person's own, `./notify`, `iwt`) is handed text it only carries.
+const ACTS_ON_ITS_WORDS: &[&str] = &[
+    "pgrep",
+    "pidof",
+    "ps",
+    "lsof",
+    "fuser",
+    "renice",
+    "skill",
+    "snice",
+    "chrt",
+    "prlimit",
+    "launchctl",
+    "loginctl",
+    "machinectl",
+    "busctl",
+    "dbus-send",
+    "gdbus",
+    "qdbus",
+    "systemd-run",
+    "setfacl",
+    "losetup",
+    "cryptsetup",
+    "ip",
+    "route",
+    "nmcli",
+    "tc",
+    "ss",
+    "netstat",
+    "helm",
+    "terraform",
+    "ansible",
+    "ansible-playbook",
+    "plutil",
+    "socketfilterfw",
+    "aureport",
+    "ausearch",
+    "auditd",
+    "osqueryi",
+    "sysctl",
+    "fsck",
+    "parted",
+    "fdisk",
+    "sfdisk",
+    "blkdiscard",
+    "hdparm",
+    "swapoff",
+    "swapon",
+    "useradd",
+    "chage",
+    "chsh",
+    "chfn",
+    "newusers",
+    "pwck",
+    "grpck",
+    "vigr",
+    "sudo",
+    "su",
+    "ssh-keygen",
+    "ssh-add",
+    "gpg",
+    "security",
+    "keychain",
+    "find",
+    "xargs",
+    "rsync",
+    "zip",
+    "unzip",
+    "tar",
+    "7z",
+    "ln",
+    "rename",
+    "rm",
+    "srm",
+    "wipe",
+    "logger",
+    "wall",
+    "write",
+    "notify-send",
+    "say",
+    "mail",
+    "sendmail",
+    "mutt",
+];
+
+/// Programs a line of text written as a command starts with: the first word
+/// of a quoted argument that is one of them makes it a command line, which
+/// stays in view ([`text_argument_stays`]).
+const COMMAND_WORDS: &[&str] = &[
+    "systemctl",
+    "service",
+    "launchctl",
+    "auditctl",
+    "augenrules",
+    "setenforce",
+    "iptables",
+    "ip6tables",
+    "iptables-restore",
+    "nft",
+    "ufw",
+    "firewall-cmd",
+    "pfctl",
+    "chpasswd",
+    "passwd",
+    "usermod",
+    "useradd",
+    "userdel",
+    "groupadd",
+    "groupmod",
+    "gpasswd",
+    "adduser",
+    "deluser",
+    "visudo",
+    "vipw",
+    "tee",
+    "echo",
+    "printf",
+    "cat",
+    "rm",
+    "shred",
+    "truncate",
+    "journalctl",
+    "logrotate",
+    "kill",
+    "pkill",
+    "killall",
+    "cp",
+    "mv",
+    "ln",
+    "chmod",
+    "chown",
+    "chattr",
+    "mount",
+    "umount",
+    "modprobe",
+    "rmmod",
+    "insmod",
+    "sysctl",
+    "dd",
+    "mkfs",
+    "wipefs",
+    "curl",
+    "wget",
+    "nc",
+    "ncat",
+    "socat",
+    "install",
+    "touch",
+    "mkdir",
+    "rmdir",
+    "unlink",
+    "ls",
+    "grep",
+    "kubectl",
+    "aws",
+    "az",
+    "gcloud",
+    "dpkg",
+    "apt",
+    "apt-get",
+    "yum",
+    "dnf",
+    "rpm",
+    "brew",
+    "pip",
+    "pip3",
+    "openssl",
+    "base64",
+    "xxd",
+    "csrutil",
+    "spctl",
+    "tccutil",
+    "defaults",
+    "dscl",
+    "sqlite3",
+    "innerwarden",
+    "innerwarden-ctl",
+    "iw",
+    "iw-guard",
+    "cd",
+    "export",
+    "unset",
+    "set",
+    "alias",
+    "read",
+    "test",
+    "true",
+    "false",
+    "sleep",
+    "wait",
+];
+
+/// The guard's own checks read a quoted, many-word argument of a program
+/// that runs none of what it is handed as data (rule of 2026-11-28: text
+/// that speaks of the guard is no act on it): a message (`./notify send ops
+/// "rotate: journalctl --vacuum-time=1s cleared the logs"`), a note, a
+/// title. Masked here for those checks only ([`ShellProjection::guard_scan`]).
+/// Kept in view: the words of a program that runs text ([`runners::program`],
+/// [`RUNS_TEXT`]), of a command whose output or file reaches one (the
+/// projection's own conditions), and each argument that may be more than
+/// text ([`text_argument_stays`]).
+fn mask_text_arguments_for_the_guard(
+    command: tree_sitter::Node<'_>,
+    source: &[u8],
+    taint: &LineTaint,
+    guard_masked: &mut Vec<Range<usize>>,
+    executable_inside_mask: &mut Vec<Range<usize>>,
+) {
+    if inside_a_substitution(command)
+        || command
+            .parent()
+            .and_then(nearest_pipeline)
+            .is_some_and(|pipeline| !stages_after_are_data_only(pipeline, command, source))
+        || has_execution_sink_ancestor(command, source)
+        || writes_security_or_execution_sink(command, source)
+        || writes_payload_executed_later(command, source)
+        || pipeline_payload_executed_later(command, source)
+        || command_writes_download_tainted_value(command, source, taint)
+        || command_evaluates_fetched_value(command, source, taint)
+    {
+        return;
+    }
+    let Some(words) = command_words(command, source) else {
+        return;
+    };
+    let Some(effective) = effective_command_words(&words, 0) else {
+        return;
+    };
+    let Some(program) = effective.first().map(|word| normalized_command_name(word)) else {
+        return;
+    };
+    if program.is_empty()
+        || program.contains(['$', '`'])
+        || runs_text(&program)
+        || COMMAND_WORDS.contains(&program.as_str())
+        || ACTS_ON_ITS_WORDS.contains(&program.as_str())
+    {
+        return;
+    }
+    let skip = words.len() - effective.len();
+    let arguments = command_arguments(command);
+    let Some(arguments) = arguments.get(skip..) else {
+        return;
+    };
+    for argument in arguments {
+        let text = shell_word(&node_text(*argument, source));
+        if text.contains(char::is_whitespace) && !text_argument_stays(&text) {
+            mask_preserving_substitutions(*argument, source, guard_masked, executable_inside_mask);
+        }
+    }
+}
+
+/// Whether `program` runs text it is handed ([`runners::program`],
+/// [`RUNS_TEXT`]).
+fn runs_text(program: &str) -> bool {
+    let plain = versionless_interpreter_name(program);
+    RUNS_TEXT.contains(&program)
+        || RUNS_TEXT.contains(&plain)
+        || runners::program(plain).is_some_and(|row| {
+            row.shell
+                || row.sink
+                || row.launcher
+                || row.prefix
+                || row.stdin_code
+                || row.stdin_script
+                || row.inline.is_some()
+                || row.file_option.is_some()
+        })
+}
+
+/// Whether a quoted argument of a program that runs no text stays in view
+/// for the guard's own checks: a command line (its first word a program, a
+/// path or an assignment), a path with blanks in it, text with a word that
+/// is a place the guard keeps (an agent's settings, a file of the guard, the
+/// account database), or a lowering of the guard spelled out, refused
+/// wherever it is written.
+fn text_argument_stays(text: &str) -> bool {
+    let text = text.trim();
+    let Some(first) = text.split_whitespace().next() else {
+        return true;
+    };
+    let first = first.trim_start_matches(['(', '{', '!']);
+    if first.contains(['/', '=', '$', '`'])
+        || COMMAND_WORDS.contains(&normalized_command_name(first).as_str())
+        || runs_text(&normalized_command_name(first))
+        || runners::program(versionless_interpreter_name(&normalized_command_name(
+            first,
+        )))
+        .is_some()
+    {
+        return true;
+    }
+    if !text.contains(['\n', '\r']) && (text.starts_with(['/', '~', '.', '$'])) {
+        return true;
+    }
+    if text
+        .split_whitespace()
+        .any(inline_calls::word_names_a_protected_place)
+    {
+        return true;
+    }
+    let lower = text.to_ascii_lowercase();
+    (lower.contains("innerwarden") || lower.contains("iw"))
+        && crate::threats::check_guard_self_disable(text).is_some()
 }
 
 fn mask_literal_command_args(
@@ -14839,9 +15443,19 @@ fn mask_data_heredoc(
     let owner = owner_command
         .and_then(|command| command_name(command, source))
         .map(|name| normalized_command_name(&name));
+    // SQL that is only data ([`sql_text::sql_text_is_data`]) handed to a
+    // SQL client, here, behind a container runner or as the remote line of
+    // `ssh` ([`sql_runner::runs_sql_client`]): the client runs none of it.
+    let sql_body = || sql_text::sql_text_is_data(&node_text(body, source));
     let data_only_pipeline = nearest_pipeline(redirected)
         .or_else(|| first_descendant_of_kind(redirected, "pipeline", 0))
-        .map(|pipeline| pipeline_is_data_only(pipeline, source))
+        .map(|pipeline| {
+            pipeline_is_data_only(pipeline, source)
+                || (matches!(owner.as_deref(), Some("cat"))
+                    && owner_command
+                        .is_some_and(|command| feeds_only_sql_clients(pipeline, command, source))
+                    && sql_body())
+        })
         .unwrap_or(true);
     // `cat/tee <<EOF` writes data. Only mask it when every command in an
     // enclosing pipeline is a known data consumer. Unknown consumers and
@@ -14854,8 +15468,9 @@ fn mask_data_heredoc(
         .is_some_and(|name| line_redefines(root_node(body), name, source));
     // A SQL client reads its input as SQL: data where the SQL is only data.
     let sql_data = owner_command.is_some_and(|command| {
-        sql_client_words(command, source).is_some()
-            && sql_text::sql_text_is_data(&node_text(body, source))
+        (sql_client_words(command, source).is_some()
+            || sql_runner::runs_sql_client(command, source))
+            && sql_body()
     });
     if (matches!(owner.as_deref(), Some("cat" | "tee"))
         || sql_data
@@ -14913,6 +15528,33 @@ fn backtick_runs(node: tree_sitter::Node<'_>, source: &[u8]) -> Vec<Range<usize>
         runs.push(range.start + start..range.end);
     }
     runs
+}
+
+/// Whether every command of `pipeline` after `owner` is a SQL client
+/// ([`sql_runner::runs_sql_client`]) or one that only handles data: `cat
+/// <<'EOF' | ssh h "psql ..."` hands the body to the client and to nothing
+/// that runs it.
+fn feeds_only_sql_clients(
+    pipeline: tree_sitter::Node<'_>,
+    owner: tree_sitter::Node<'_>,
+    source: &[u8],
+) -> bool {
+    if inside_a_substitution(pipeline) {
+        return false;
+    }
+    let mut commands = Vec::new();
+    collect_commands(pipeline, &mut commands, 0);
+    let after: Vec<_> = commands
+        .into_iter()
+        .filter(|command| command.start_byte() >= owner.end_byte())
+        .collect();
+    after
+        .iter()
+        .any(|command| sql_runner::runs_sql_client(*command, source))
+        && after.iter().all(|command| {
+            sql_runner::runs_sql_client(*command, source)
+                || classify_pipeline_command(*command, source) == PipelineCommand::DataOnly
+        })
 }
 
 /// Whether the unquoted here-document `body` of `command` expands a value
@@ -16393,6 +17035,132 @@ fn basename(name: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// For the guard's own checks the masks are in doubt only where a
+    /// command may take away the trust they give a name.
+    #[test]
+    fn the_guard_doubts_the_masks_only_where_a_name_may_mean_another_program() {
+        for line in [
+            "cat <<'EOF'\nx\nEOF\npython3 -c 'print(1)'",
+            "./tool a; cat <<'EOF'\nx\nEOF",
+            "/opt/bin/tool x; ls",
+        ] {
+            let projected = project(line);
+            assert!(projected.masks_in_doubt, "{line}");
+            assert!(!projected.guard_masks_in_doubt, "{line}");
+        }
+        for line in [
+            "f(){ :; }; cat <<'EOF'\nx\nEOF",
+            "alias c=cat; ls",
+            "command alias x=y; ls",
+            "/tmp/x/cat <<'EOF'\nx\nEOF\nls",
+            "$X a; ls",
+            "PATH=/x ls",
+            "/opt/bin/python3 -c 'print(1)'; ls",
+            "/opt/bin/psql -c 'select 1'; ls",
+            "ssh db psql < <(echo 'a b')",
+            "bash <(printf 'a b')",
+            "docker exec -i c psql < <(echo 'a b')",
+        ] {
+            assert!(project(line).guard_masks_in_doubt, "{line}");
+        }
+        assert!(!project("diff <(ls a) <(ls b)").guard_masks_in_doubt);
+    }
+
+    /// A message handed to a program that runs none of it is masked for the
+    /// guard's own checks; a command line, a path, a place the guard keeps,
+    /// a lowering of the guard, and the words of a program that runs text,
+    /// or whose output reaches one, are not.
+    #[test]
+    fn a_message_is_masked_for_the_guard_only() {
+        let line = "./notify send ops \"rotate: the logs were cleared\"";
+        let projected = project(line);
+        assert!(projected.scan.contains("rotate"));
+        assert!(
+            !projected.guard_scan.contains("rotate"),
+            "{}",
+            projected.guard_scan
+        );
+        assert!(projected.guard_scan.starts_with("./notify send ops"));
+        assert!(!project("sudo ./notify \"rotate: a b\"")
+            .guard_scan
+            .contains("rotate"));
+        for line in [
+            "./notify send \"systemctl stop auditd\"",
+            "./notify \"/Users/A B/x\"",
+            "./notify \"~/x y\"",
+            "./notify \"see ~/.claude/settings.json now\"",
+            "./notify \"innerwarden allow x\"",
+            "./notify \"FOO=1 bar\"",
+            "./notify \"./run it\"",
+            "./notify \"python3 x.py\"",
+            "bash -c \"rotate: x y\"",
+            "./notify \"rotate: a b\" | sh",
+            "x=$(./notify \"rotate: a b\")",
+            "claude -p \"rotate: a b\"",
+            "git commit -m \"rotate: a b\" | sh",
+            "./notify one",
+            "pkill -f 'hook --agent x'",
+            "killall -r 'rotate a b'",
+        ] {
+            let projected = project(line);
+            assert_eq!(projected.guard_scan, projected.scan, "{line}");
+        }
+        assert!(runs_text("python3.12"));
+        assert!(runs_text("ssh"));
+        assert!(!runs_text("notify"));
+    }
+
+    /// SQL that is only data, handed by a here-document to a client on
+    /// another host or through `cat` to one, is data; SQL that runs a
+    /// program, or a body handed to a shell, is not.
+    #[test]
+    fn sql_that_is_only_data_for_a_remote_client_is_masked() {
+        for line in [
+            "ssh h1 \"psql -d app\" <<'EOF'\ninsert into t values ('rotate a b');\nEOF",
+            "cat <<'EOF' | ssh h1 \"psql -d app\"\ninsert into t values ('rotate a b');\nEOF",
+        ] {
+            assert!(!project(line).scan.contains("rotate"), "{line}");
+        }
+        for line in [
+            "cat <<'EOF' | ssh h1 \"psql -d app\"\n\\! rotate\nEOF",
+            "cat <<'EOF' | sh\ninsert into t values ('rotate a b');\nEOF",
+            "x=$(cat <<'EOF' | ssh h1 \"psql -d app\"\ninsert into t values ('rotate a b');\nEOF\n)",
+        ] {
+            assert!(project(line).scan.contains("rotate"), "{line}");
+        }
+    }
+
+    /// `python3 - FILE`: the program is read from the input, the file is
+    /// the program's own argument.
+    #[test]
+    fn a_dash_reads_the_program_from_the_input() {
+        let reading = inline_code_reading("python3 - notes.txt <<'EOF'\nprint('x y')\nEOF");
+        assert!(reading.code.contains("print"), "{}", reading.code);
+        assert!(!reading.code.contains("notes.txt"), "{}", reading.code);
+        assert_eq!(
+            python_code_input(&["-".to_owned(), "f".to_owned()]),
+            CodeInput::Stdin
+        );
+    }
+
+    /// The text inline code edits is taken out for the guard's own checks,
+    /// unless its output reaches a command or the line runs a file.
+    #[test]
+    fn the_guard_reads_inline_code_without_its_text() {
+        let line = "python3 - <<'EOF'\np='n.md'\nopen(p,'w').write('''rotate\nall''')\nEOF";
+        let reading = inline_code_reading(line);
+        let read = with_inline_guard_blanked(line, &reading).expect("blanked");
+        assert!(!read.contains("rotate"), "{read}");
+        assert!(read.contains("n.md"), "{read}");
+        for line in [
+            "python3 - <<'EOF' | sh\nprint('''rotate\nall''')\nEOF",
+            "python3 - <<'EOF'\nopen('r.sh','w').write('''rotate\nall''')\nEOF\nbash r.sh",
+        ] {
+            let reading = inline_code_reading(line);
+            assert_eq!(with_inline_guard_blanked(line, &reading), None, "{line}");
+        }
+    }
 
     /// [`ancestors_of`] is the chain [`tree_sitter::Node::parent`] gives,
     /// step after step, for every node of a line.

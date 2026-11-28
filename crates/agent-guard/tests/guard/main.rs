@@ -22,6 +22,7 @@ mod guard_reading_wave4b;
 mod guard_reading_wave4c;
 mod guard_takedown_by_inline_code;
 mod guard_target_from_assignment_and_ansi_c;
+mod guard_text_is_not_action;
 mod guard_text_is_not_the_guard;
 mod guard_user_units;
 mod guard_word_mention_and_action;

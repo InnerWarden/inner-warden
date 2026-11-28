@@ -3799,9 +3799,9 @@ impl WorkingContext {
 /// puts either in doubt is read as written as well.
 fn guard_self_disable_on(
     cmd: &str,
-    projection: &crate::shell::ShellProjection,
+    raw_scan: &str,
+    masks_in_doubt: bool,
 ) -> Option<(&'static str, u32)> {
-    let raw_scan = projection.scan.as_str();
     let scan_owned = crate::threats::strip_shell_noops(raw_scan);
     let scan_cmd = scan_owned.as_str();
     threats::check_guard_self_disable(scan_cmd)
@@ -3811,7 +3811,7 @@ fn guard_self_disable_on(
                 .flatten()
         })
         .or_else(|| {
-            (projection.masks_in_doubt && cmd != raw_scan)
+            (masks_in_doubt && cmd != raw_scan)
                 .then(|| threats::check_guard_self_disable(cmd))
                 .flatten()
         })
@@ -3824,6 +3824,121 @@ fn guard_self_disable_on(
                 .then(|| threats::check_child_agent_without_its_hook(cmd))
                 .flatten()
         })
+}
+
+/// The line as the guard's own checks (an act on the guard, a security
+/// monitor tampered with) read it: text that only speaks of the guard is no
+/// act on it. Two pieces of a line are taken out:
+///
+/// - The strings of inline code that are only text the code edits, prints
+///   or writes ([`crate::shell::with_inline_guard_blanked`]): what code acts
+///   on is what it calls. A string that may name a file stays, so a write of
+///   an agent's settings or of a file of the guard is read as before, and
+///   the lines code hands to processes are judged where they are handed on.
+/// - The words of the line `ssh` runs on another host, where that line is
+///   judged as a line of its own ([`crate::shell::ssh_remote_lines`]), which
+///   charges both families there ([`ANY_HOST_SIGNALS`]): a search pattern
+///   or a message in it is data there, as it is here.
+///
+/// Read only for a line one of the checks refuses as written: a finding
+/// stands where it stands on this reading too.
+struct GuardReading<'a> {
+    inline: &'a crate::shell::InlineReading,
+    cmd: &'a str,
+    depth: u8,
+    remote: Option<Vec<String>>,
+    /// The masks of the projection in doubt as written, and as the guard's
+    /// own checks read them.
+    masks_in_doubt: bool,
+    doubt: bool,
+}
+
+impl<'a> GuardReading<'a> {
+    fn new(
+        inline: &'a crate::shell::InlineReading,
+        cmd: &'a str,
+        depth: u8,
+        projection: &crate::shell::ShellProjection,
+    ) -> Self {
+        // What the masks hide stays in doubt where the code runs what the
+        // reader does not read, or the line runs a file it writes; and on a
+        // line that names the guard, as before: a lowering of the guard
+        // spelled out is refused wherever it is written, a mention held for
+        // review ([`mention_only`]), and the masks hide a printed one
+        // (`python3 -c "print('innerwarden allow x')" > x.sh`).
+        let doubt = projection.guard_masks_in_doubt
+            || inline.unread
+            || inline.code_unread
+            || inline.runs_download
+            || names_the_guard(cmd)
+            || crate::shell::line_may_run_a_written_file_for_the_guard(
+                cmd,
+                &inline
+                    .written
+                    .iter()
+                    .map(|(path, _)| path.clone())
+                    .collect::<Vec<_>>(),
+                !inline.code.is_empty(),
+            );
+        Self {
+            inline,
+            cmd,
+            depth,
+            remote: None,
+            masks_in_doubt: projection.masks_in_doubt,
+            doubt: projection.masks_in_doubt && doubt,
+        }
+    }
+
+    /// `text` as read, `None` where nothing is taken out.
+    fn text(&mut self, text: &str) -> Option<String> {
+        if self.remote.is_none() {
+            // A remote line is judged on its own only below this depth.
+            self.remote = Some(if self.depth < STARTUP_PAYLOAD_DEPTH {
+                crate::shell::ssh_remote_lines(self.cmd)
+            } else {
+                Vec::new()
+            });
+        }
+        let remote = self.remote.as_deref().unwrap_or_default();
+        let blanked = crate::shell::with_inline_guard_blanked(text, self.inline);
+        let base = blanked.as_deref().unwrap_or(text);
+        crate::shell::ssh_remote_words_blanked(base, remote).or(blanked)
+    }
+
+    /// The line as written and its projection as read (`guard_scan`, the
+    /// projection `scan` with the text a program that runs none of it is
+    /// handed masked too), and whether the masks are in doubt, where any of
+    /// them changes.
+    fn texts(&mut self, scan: &str, guard_scan: &str) -> Option<(String, String, bool)> {
+        let cmd = self.cmd;
+        let read_cmd = self.text(cmd);
+        let read_scan = self.text(guard_scan);
+        if read_cmd.is_none()
+            && read_scan.is_none()
+            && guard_scan == scan
+            && self.doubt == self.masks_in_doubt
+        {
+            return None;
+        }
+        Some((
+            read_cmd.unwrap_or_else(|| cmd.to_owned()),
+            read_scan.unwrap_or_else(|| guard_scan.to_owned()),
+            self.doubt,
+        ))
+    }
+}
+
+/// Whether `line` names one of the guard's programs (`innerwarden`,
+/// `innerwarden-ctl`, `iw`, `iw-guard`), as a word or in a path.
+fn names_the_guard(line: &str) -> bool {
+    static NAMED: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    NAMED
+        .get_or_init(|| {
+            regex::Regex::new(r#"(?i)innerwarden|(?:^|[\s/'"=;|&(])iw(?:-guard)?(?:$|[\s'";|&)])"#)
+                .expect("static guard name regex")
+        })
+        .is_match(line)
 }
 
 pub fn related_roots_of(root: &std::path::Path) -> Vec<std::path::PathBuf> {
@@ -5334,34 +5449,47 @@ fn analyze_command_as_read(
     // directory the hook was given (`mv ../.config x` from a project in the
     // home), or a home the text alone does not know, is asked first: the
     // text alone may only hold it for review.
-    let self_disable = context
-        .and_then(|place| {
-            threats::guard_config_ancestor_in_place(
-                &projection.scan,
-                &place.cwd,
-                place.home.as_deref(),
-            )
-        })
-        .or_else(|| guard_self_disable_on(cmd, &projection))
-        // The same program fed to the interpreter as a here-document is read as
-        // the same code given inline (`python3 -c`), so a rewrite of an agent's
-        // settings or of the guard's configuration is refused either way.
-        .or_else(|| {
-            crate::shell::interpreter_input_as_inline_code(cmd)
-                .iter()
-                .find_map(|line| threats::check_code_rewrites_guard_carrier(line))
-        })
-        // Inline code that writes, removes or moves a place of the guard or
-        // signals its processes, a copy onto one of its places, and a
-        // program a search runs that does either ([`threats::check_guard_takedown`]).
-        .or_else(|| threats::check_guard_takedown(cmd))
-        // A file of the guard named relative to the folder the hook was
-        // given (`rm -rf innerwarden/rules` run in `/etc`).
-        .or_else(|| {
-            context.and_then(|place| {
-                threats::guard_file_reached_in_place(cmd, &place.cwd, place.home.as_deref())
+    let self_disable_of = |cmd: &str, scan: &str, masks_in_doubt: bool| {
+        context
+            .and_then(|place| {
+                threats::guard_config_ancestor_in_place(scan, &place.cwd, place.home.as_deref())
             })
-        });
+            .or_else(|| guard_self_disable_on(cmd, scan, masks_in_doubt))
+            // The same program fed to the interpreter as a here-document is
+            // read as the same code given inline (`python3 -c`), so a
+            // rewrite of an agent's settings or of the guard's configuration
+            // is refused either way.
+            .or_else(|| {
+                crate::shell::interpreter_input_as_inline_code(cmd)
+                    .iter()
+                    .find_map(|line| threats::check_code_rewrites_guard_carrier(line))
+            })
+            // Inline code that writes, removes or moves a place of the
+            // guard or signals its processes, a copy onto one of its places,
+            // and a program a search runs that does either
+            // ([`threats::check_guard_takedown`]).
+            .or_else(|| threats::check_guard_takedown(cmd))
+            // A file of the guard named relative to the folder the hook was
+            // given (`rm -rf innerwarden/rules` run in `/etc`).
+            .or_else(|| {
+                context.and_then(|place| {
+                    threats::guard_file_reached_in_place(cmd, &place.cwd, place.home.as_deref())
+                })
+            })
+    };
+    // Text that speaks of the guard is no act on it: a finding stands only
+    // where it stands on the line as the guard's own checks read it
+    // ([`GuardReading`]), the text inline code only edits or prints taken
+    // out and the line `ssh` runs on another host left to its own reading.
+    let mut guard_reading = GuardReading::new(&inline_code, cmd, depth, &projection);
+    let mut self_disable = self_disable_of(cmd, &projection.scan, projection.masks_in_doubt);
+    if self_disable.is_some() {
+        if let Some((cmd, scan, doubt)) =
+            guard_reading.texts(&projection.scan, &projection.guard_scan)
+        {
+            self_disable = self_disable_of(&cmd, &scan, doubt);
+        }
+    }
     if let Some((what, s)) = self_disable {
         signals.push(AnalysisSignal {
             signal: "guard_self_disable".into(),
@@ -5989,7 +6117,7 @@ fn analyze_command_as_read(
         let mut seen = std::collections::HashSet::new();
         for (mut lines, handed_by) in [
             (
-                inline_code.lines,
+                inline_code.lines.clone(),
                 "in a line inline code hands to a process",
             ),
             (handed_to_shell.lines, "in a line handed to a shell to run"),
@@ -6335,20 +6463,37 @@ fn analyze_command_as_read(
     // A value the projection drops (`S=$(printf innerwarden-agent)`) is read
     // into the line as written first, and that reading projected in turn:
     // quoted data in it stays data.
-    let read_in: Vec<String> = threats::assignment_readings_past_written(cmd)
-        .iter()
-        .map(|reading| threats::strip_shell_noops(&crate::shell::project(reading).scan))
-        .collect();
-    let tamper = [
-        Some(scan_cmd),
-        Some(raw_scan),
-        projection.masks_in_doubt.then_some(cmd),
-    ]
-    .into_iter()
-    .flatten()
-    .chain(read_in.iter().map(String::as_str))
-    .filter_map(threats::check_security_tamper)
-    .max_by_key(|(_, s)| *s);
+    let tamper_of = |cmd: &str, raw_scan: &str, masks_in_doubt: bool, guard: bool| {
+        let scan_cmd = threats::strip_shell_noops(raw_scan);
+        let read_in: Vec<String> = threats::assignment_readings_past_written(cmd)
+            .iter()
+            .map(|reading| {
+                let projected = crate::shell::project(reading);
+                threats::strip_shell_noops(if guard {
+                    &projected.guard_scan
+                } else {
+                    &projected.scan
+                })
+            })
+            .collect();
+        [
+            Some(scan_cmd.as_str()),
+            Some(raw_scan),
+            masks_in_doubt.then_some(cmd),
+        ]
+        .into_iter()
+        .flatten()
+        .chain(read_in.iter().map(String::as_str))
+        .filter_map(threats::check_security_tamper)
+        .max_by_key(|(_, s)| *s)
+    };
+    let mut tamper = tamper_of(cmd, raw_scan, projection.masks_in_doubt, false);
+    // As the guard's own checks read the line ([`GuardReading`]).
+    if tamper.is_some() {
+        if let Some((cmd, scan, doubt)) = guard_reading.texts(raw_scan, &projection.guard_scan) {
+            tamper = tamper_of(&cmd, &scan, doubt, true);
+        }
+    }
     if let Some((indicator, s)) = tamper {
         let detail = format!("disabling or tampering with security monitoring: `{indicator}`");
         // A read of the guard's store is charged once: the line `ssh` runs
@@ -6928,6 +7073,22 @@ fn check_shell_internal_target(command: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_name_of_the_guard_is_a_word_or_a_path() {
+        for line in [
+            "innerwarden allow x",
+            "/usr/local/bin/iw status",
+            "iw-guard hook",
+            "x=iw; $x",
+            "cd ~/src/InnerWarden && ls",
+        ] {
+            assert!(names_the_guard(line), "{line}");
+        }
+        for line in ["./iwt send ops hi", "kiwi", "echo iwx", "ls /srv/iwatch"] {
+            assert!(!names_the_guard(line), "{line}");
+        }
+    }
 
     /// A name the remote line is charged with is a name a check raises: a
     /// misspelt one would leave that finding uncharged on the other host.

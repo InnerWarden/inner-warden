@@ -687,3 +687,21 @@ harmless. A malicious or `must_refuse` line cannot be waived here.
   (`cp "$(which innerwarden)" /tmp/iw-copy`) goes from deny to review: a
   copy from the guard's program reads it and changes nothing of it; the
   guard's program as the destination of a copy stays refused (gle-055).
+- 2026-11-28: guard-text-not-action-2026-11 is new. Text that speaks of the
+  guard or of a host's security is no act on either: the guard's own
+  checks (`guard_self_disable`, `security_tooling_tamper`) read a line with
+  the line `ssh` runs on another host left to its own reading, the strings
+  inline code only edits or prints taken out (a string that may name a
+  file kept), a quoted message handed to a program the guard does not know
+  masked, and the masks in doubt only where a command may make a name
+  another program, on a line that names no program of the guard
+  (`mcp::GuardReading`). `python3 - FILE` reads its program from its
+  input, and SQL that is only data, handed by a here-document to a SQL
+  client on another host or through `cat` to one, is data. gtn-001 to
+  gtn-027 are must_refuse, held by `tests/guard/guard_text_is_not_action.rs`.
+  harmless-proven:
+  guard-text-not-action-2026-11/gtn-c01 guard-text-not-action-2026-11/gtn-c02 guard-text-not-action-2026-11/gtn-c09 guard-text-not-action-2026-11/gtn-c10
+  go from deny to allow: a search pattern in the line `ssh` runs on
+  another host, a note `cat` writes beside an interpreter, SQL that is
+  only data handed through `cat` to a client on another host, and a
+  message handed to a tool of one's own.
