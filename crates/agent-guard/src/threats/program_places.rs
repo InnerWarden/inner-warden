@@ -243,10 +243,7 @@ pub(super) fn arguments_of(program: &str, arguments: &[&str]) -> Arguments {
         }
         "find" => has(&|w| matches!(w, "-exec" | "-execdir" | "-ok" | "-okdir")),
         "fd" | "fdfind" => has(&|w| matches!(w, "-x" | "-X" | "--exec" | "--exec-batch")),
-        "cargo" => arguments
-            .iter()
-            .find(|w| !(w.starts_with('-') || w.starts_with('+')))
-            .is_some_and(|sub| matches!(*sub, "run" | "r")),
+        "cargo" => cargo_subcommand(arguments).is_some_and(|sub| matches!(sub, "run" | "r")),
         "ssh" => true,
         // `git -c alias.x='!cmd'`, `git bisect run CMD`, `git rebase --exec
         // CMD`, `git submodule foreach CMD` and a configuration it writes
@@ -278,6 +275,217 @@ pub(super) fn arguments_of(program: &str, arguments: &[&str]) -> Arguments {
     } else {
         Arguments::Unknown
     }
+}
+
+/// The options cargo takes before its subcommand that are given a value as
+/// the next word (`cargo --color always run`, `cargo -C /src/proj run`). A
+/// `+toolchain` and any other option stand alone.
+const CARGO_GLOBAL_VALUED: &[&str] = &[
+    "--color",
+    "-C",
+    "--config",
+    "--manifest-path",
+    "-Z",
+    "-j",
+    "--jobs",
+    "--target-dir",
+    "--explain",
+];
+
+/// cargo's subcommand among `arguments` (the words after `cargo`): the first
+/// word that is neither an option nor the value of one it takes before the
+/// subcommand ([`CARGO_GLOBAL_VALUED`]). Taken as the first word that is not
+/// an option, `cargo --color always run -p NAME` ran `always`, and the
+/// package it builds and runs was read as a mention.
+fn cargo_subcommand<'a>(arguments: &[&'a str]) -> Option<&'a str> {
+    let mut words = arguments.iter();
+    while let Some(word) = words.next() {
+        if word.starts_with('+') {
+            continue;
+        }
+        if word.starts_with('-') {
+            if CARGO_GLOBAL_VALUED.contains(word) {
+                words.next();
+            }
+            continue;
+        }
+        return Some(word);
+    }
+    None
+}
+
+/// The options of `cargo run` that name the package or binary it builds and
+/// runs.
+const CARGO_RUN_PROGRAM_OPTIONS: &[&str] = &["-p", "--package", "--bin", "--example"];
+
+/// Whether `text`, an option of `cargo run`, holds the package or binary it
+/// runs glued on (`--bin=NAME`, `--package=NAME`, `-pNAME`, `-qpNAME`): the
+/// same as that option and its value as two words.
+pub(super) fn cargo_run_program_glued(text: &str) -> Option<&str> {
+    if let Some(long) = text.strip_prefix("--") {
+        let (option, value) = long.split_once('=')?;
+        return (CARGO_RUN_PROGRAM_OPTIONS.contains(&format!("--{option}").as_str())
+            && !value.is_empty())
+        .then_some(value);
+    }
+    let letters = text.strip_prefix('-')?;
+    // A cluster of short flags, the value glued after `p`. Another option
+    // that takes a value (`-j`, `-Z`, `-C`, `-F`) ends the cluster.
+    for (at, letter) in letters.char_indices() {
+        match letter {
+            'p' => {
+                let value = &letters[at + 1..];
+                return (!value.is_empty()).then_some(value);
+            }
+            'j' | 'Z' | 'C' | 'F' => return None,
+            letter if letter.is_ascii_alphabetic() => {}
+            _ => return None,
+        }
+    }
+    None
+}
+
+/// Whether `text`, an option of `cargo run`, takes the package or binary it
+/// runs as the next word (`-p`, `--bin`, `-qp`).
+fn cargo_run_program_option(text: &str) -> bool {
+    CARGO_RUN_PROGRAM_OPTIONS.contains(&text)
+        || text.strip_prefix('-').is_some_and(|letters| {
+            !letters.starts_with('-')
+                && letters.ends_with('p')
+                && letters.chars().all(|c| c.is_ascii_alphabetic())
+                && !letters.contains(['j', 'Z', 'C', 'F'])
+        })
+}
+
+/// The ssh client's programs: each takes `ssh`'s `-o` options, and so runs
+/// the commands some of them name on this host.
+pub(super) const SSH_FAMILY: &[&str] = &["ssh", "scp", "sftp", "slogin", "autossh"];
+
+/// The `ssh` settings whose value is a command line run on this host, by a
+/// shell, when the client connects: the proxy, the command after the
+/// connection (with `PermitLocalCommand`), the known-hosts lookup.
+const SSH_LOCAL_COMMAND_KEYS: &[&str] = &["proxycommand", "localcommand", "knownhostscommand"];
+
+/// The command lines an ssh client program (`ssh`, `scp`, `sftp`) runs on
+/// this host from its `-o` options, wherever they stand among its words:
+/// `-o ProxyCommand=CMD`, `-oProxyCommand=CMD`, `-o "ProxyCommand CMD"`,
+/// `LocalCommand` and `KnownHostsCommand` the same, and `-o 'Match exec
+/// CMD'`. `program`: the program's name, lowercase, no folder; `arguments`:
+/// the words after it.
+///
+/// Each runs where a program runs: the guard named in it is the guard
+/// (`scp -o ProxyCommand="innerwarden $V" x h1:y` ran the guard with a verb
+/// the line does not show, held for review as an argument of `scp`).
+pub(super) fn ssh_local_commands<'a>(program: &str, arguments: &[&'a str]) -> Vec<&'a str> {
+    if !SSH_FAMILY.contains(&program) {
+        return Vec::new();
+    }
+    arguments
+        .iter()
+        .filter_map(|word| {
+            let setting = match word.strip_prefix('-') {
+                // `-oSetting`, `-4oSetting`: the value glued after `o`.
+                Some(letters) if !letters.starts_with('-') => {
+                    let at = letters.find('o')?;
+                    letters[..at]
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric())
+                        .then(|| &letters[at + 1..])?
+                }
+                Some(_) => return None,
+                None => word,
+            };
+            ssh_setting_command(setting)
+        })
+        .collect()
+}
+
+/// The remote shell `rsync` runs on this host (`-e CMD`, `-eCMD`, `-avze
+/// CMD`, `--rsh=CMD`, `--rsh CMD`): a command line, and an `ssh` in it runs
+/// what its own options name. `None` for another program or none given.
+pub(super) fn rsync_remote_shell<'a>(program: &str, arguments: &[&'a str]) -> Option<&'a str> {
+    if program != "rsync" {
+        return None;
+    }
+    let mut words = arguments.iter();
+    while let Some(word) = words.next() {
+        if *word == "--" {
+            return None;
+        }
+        if let Some(value) = word.strip_prefix("--rsh=") {
+            return Some(value);
+        }
+        if *word == "--rsh" {
+            return words.next().copied();
+        }
+        let Some(letters) = word.strip_prefix('-').filter(|l| !l.starts_with('-')) else {
+            continue;
+        };
+        if let Some(at) = letters.find('e') {
+            if letters[..at].chars().all(|c| c.is_ascii_alphanumeric()) {
+                let glued = &letters[at + 1..];
+                return if glued.is_empty() {
+                    words.next().copied()
+                } else {
+                    Some(glued)
+                };
+            }
+        }
+    }
+    None
+}
+
+/// [`ssh_local_commands`] of a simple command: the program a launcher in
+/// front of it runs too (`sudo scp -o ...`, `timeout 9 sftp -o ...`).
+pub(super) fn ssh_local_commands_of(words: &[Word]) -> Vec<String> {
+    let texts: Vec<String> = words.iter().map(|w| w.text.clone()).collect();
+    let Some(at) = super::launched_command_index(&texts) else {
+        return Vec::new();
+    };
+    let program = super::program_name(&texts[at]);
+    let arguments: Vec<&str> = texts[at + 1..].iter().map(String::as_str).collect();
+    ssh_local_commands(&program, &arguments)
+        .into_iter()
+        .map(str::to_string)
+        .collect()
+}
+
+/// The command line an `ssh` setting written as `Key=value` or `Key value`
+/// runs on this host, if it is one of [`SSH_LOCAL_COMMAND_KEYS`] (a value of
+/// `none` runs nothing) or a `Match` with an `exec` criterion.
+fn ssh_setting_command(setting: &str) -> Option<&str> {
+    let setting = setting.trim_start();
+    let key_end = setting.find(|c: char| c == '=' || c.is_whitespace())?;
+    let key = setting[..key_end].to_ascii_lowercase();
+    let value = setting[key_end..]
+        .trim_start()
+        .strip_prefix('=')
+        .unwrap_or(&setting[key_end..])
+        .trim();
+    if SSH_LOCAL_COMMAND_KEYS.contains(&key.as_str()) {
+        return (!value.is_empty() && !value.eq_ignore_ascii_case("none")).then_some(value);
+    }
+    if key != "match" {
+        return None;
+    }
+    // `Match [!]exec "CMD"` among other criteria: the argument after `exec`,
+    // whole when it is quoted.
+    let mut rest = value;
+    while !rest.is_empty() {
+        let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+        let criterion = rest[..end].trim_start_matches('!');
+        rest = rest[end..].trim_start();
+        if !criterion.eq_ignore_ascii_case("exec") {
+            continue;
+        }
+        if let Some(quoted) = rest.strip_prefix('"') {
+            let close = quoted.find('"').unwrap_or(quoted.len());
+            return Some(&quoted[..close]).filter(|command| !command.trim().is_empty());
+        }
+        let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+        return Some(&rest[..end]).filter(|command| !command.is_empty());
+    }
+    None
 }
 
 /// What each word of a simple command can be.
@@ -358,15 +566,17 @@ fn fill(words: &[Word], from: usize, to: usize, places: &mut [WordPlace]) {
         "cargo" => {
             set(places, WordPlace::Data);
             if arguments_of("cargo", &shown) == Arguments::Run {
-                // The package or binary it builds and runs, up to `--`.
-                for j in after..to.saturating_sub(1) {
-                    if words[j].text == "--" {
+                // The package or binary it builds and runs, up to `--`: the
+                // word after its option, or the option's own word when the
+                // value is glued on (`--bin=NAME`, `-pNAME`).
+                for j in after..to {
+                    let text = words[j].text.as_str();
+                    if text == "--" {
                         break;
                     }
-                    if matches!(
-                        words[j].text.as_str(),
-                        "-p" | "--package" | "--bin" | "--example"
-                    ) {
+                    if cargo_run_program_glued(text).is_some() {
+                        places[j] = WordPlace::Program;
+                    } else if cargo_run_program_option(text) && j + 1 < to {
                         places[j + 1] = WordPlace::Program;
                     }
                 }
@@ -435,7 +645,10 @@ fn ssh_command_start(words: &[Word]) -> Option<usize> {
 
 #[cfg(test)]
 mod tests {
-    use super::{places, WordPlace};
+    use super::{
+        cargo_run_program_glued, cargo_subcommand, places, rsync_remote_shell, ssh_local_commands,
+        WordPlace,
+    };
 
     fn read(line: &str) -> Vec<(String, WordPlace)> {
         let line = crate::shell_words::read_line(line);
@@ -548,6 +761,94 @@ mod tests {
                     .any(|(text, place)| text == word && *place == WordPlace::Any),
                 "{line}"
             );
+        }
+    }
+
+    #[test]
+    fn cargos_subcommand_is_past_its_own_options_and_their_values() {
+        for (words, sub) in [
+            (&["run", "-p", "x"][..], Some("run")),
+            (&["--color", "always", "run"][..], Some("run")),
+            (&["-C", "/src/p", "run"][..], Some("run")),
+            (&["+stable", "-j", "4", "test"][..], Some("test")),
+            (&["--config", "x=1", "-Z", "u", "r"][..], Some("r")),
+            (&["-q", "--locked", "build"][..], Some("build")),
+            (&["--color"][..], None),
+        ] {
+            assert_eq!(cargo_subcommand(words), sub, "{words:?}");
+        }
+    }
+
+    #[test]
+    fn a_package_glued_to_cargo_runs_option_is_read_as_its_value() {
+        for (text, value) in [
+            ("--bin=innerwarden", Some("innerwarden")),
+            ("--package=innerwarden", Some("innerwarden")),
+            ("--example=x", Some("x")),
+            ("-pinnerwarden", Some("innerwarden")),
+            ("-qpinnerwarden", Some("innerwarden")),
+            ("-p", None),
+            ("--bin=", None),
+            ("--profile=dev", None),
+            ("-j4", None),
+            ("--release", None),
+        ] {
+            assert_eq!(cargo_run_program_glued(text), value, "{text}");
+        }
+        for (line, word) in [
+            ("cargo run --bin=innerwarden -- x", "--bin=innerwarden"),
+            ("cargo run -pinnerwarden -- x", "-pinnerwarden"),
+            ("cargo run -qp innerwarden -- x", "innerwarden"),
+            ("cargo --color always run -p innerwarden", "innerwarden"),
+        ] {
+            assert_eq!(place_of(line, word), WordPlace::Program, "{line}");
+        }
+        assert_eq!(
+            place_of("cargo test --bin=innerwarden x", "--bin=innerwarden"),
+            WordPlace::Data
+        );
+    }
+
+    #[test]
+    fn an_ssh_clients_option_that_runs_a_command_gives_that_command() {
+        for (program, words, commands) in [
+            (
+                "scp",
+                &["-o", "ProxyCommand=iw x", "a", "h:b"][..],
+                &["iw x"][..],
+            ),
+            (
+                "scp",
+                &["-oProxyCommand=iw x", "a", "h:b"][..],
+                &["iw x"][..],
+            ),
+            ("sftp", &["-4oLocalCommand iw y", "h"][..], &["iw y"][..]),
+            (
+                "ssh",
+                &["-o", "knownhostscommand = iw z", "h"][..],
+                &["iw z"][..],
+            ),
+            (
+                "scp",
+                &["-o", "Match host h exec \"iw a b\"", "a", "h:b"][..],
+                &["iw a b"][..],
+            ),
+            ("ssh", &["-o", "Match !exec iw", "h"][..], &["iw"][..]),
+            ("scp", &["-o", "ProxyCommand=none", "a", "h:b"][..], &[][..]),
+            ("scp", &["-o", "ConnectTimeout=5", "a", "h:b"][..], &[][..]),
+            ("cp", &["-o", "ProxyCommand=iw x"][..], &[][..]),
+        ] {
+            assert_eq!(ssh_local_commands(program, words), commands, "{words:?}");
+        }
+        for (words, shell) in [
+            (&["-e", "ssh -p 2", "a", "h:b"][..], Some("ssh -p 2")),
+            (&["-avze", "ssh", "a", "h:b"][..], Some("ssh")),
+            (&["-essh -q", "a"][..], Some("ssh -q")),
+            (&["--rsh=ssh", "a"][..], Some("ssh")),
+            (&["--rsh", "ssh", "a"][..], Some("ssh")),
+            (&["-av", "a", "h:b"][..], None),
+        ] {
+            assert_eq!(rsync_remote_shell("rsync", words), shell, "{words:?}");
         }
     }
 }

@@ -249,3 +249,147 @@ fn a_command_behind_rtk_is_judged_as_run_alone() {
         "deny",
     );
 }
+
+/// The package `cargo run` builds and runs, glued to its option
+/// (`--bin=NAME`, `--package=NAME`, `-pNAME`), is that package as the two
+/// words are, and the guard's verb written anywhere after the guard's name
+/// is refused, not only right after it.
+///
+/// FAILS ON REVERT: read a glued value as no name (`program_places::fill`
+/// without `cargo_run_program_glued`, `guard_program_or_glued` answering
+/// `guard_program`, `guard_cli_named_by` without
+/// `attached_option_values_of`) and the first four lines and the three
+/// glued `allow` and `uninstall` lines are let through; ask `found_written`
+/// for `agent kernel` right after the name only
+/// (`guard_verbs_after_any_program`) and `ls innerwarden x agent kernel off`
+/// is; read the loosening verbs right after a name only
+/// (`loosening_verb_written_from` answering `false`) and `./run innerwarden
+/// x allow foo` is.
+#[test]
+fn the_guards_package_glued_to_cargos_option_is_the_guard() {
+    check(
+        &[
+            "cargo run --bin=innerwarden -- agent kernel off",
+            "cargo run --package=innerwarden -- agent kernel off",
+            "cargo run -pinnerwarden -- agent kernel off",
+            "cargo run -q --bin=innerwarden -- agent kernel off",
+            "./run innerwarden x agent kernel off",
+            "ls innerwarden x agent kernel off",
+            "cargo run --bin=innerwarden -- allow foo",
+            "cargo run --bin=innerwarden --release -- allow foo",
+            "cargo run -pinnerwarden -- uninstall",
+            "./run innerwarden x allow foo",
+        ],
+        "deny",
+    );
+    check(
+        &[
+            "cargo run --bin=mytool -- status",
+            "cargo test --package=innerwarden x",
+            "cargo -q run --bin=innerwarden -- status",
+        ],
+        "allow",
+    );
+}
+
+/// cargo's own options before its subcommand, with their values, are not
+/// the subcommand: `cargo --color always run -p NAME` builds and runs NAME.
+///
+/// FAILS ON REVERT: take the first word after `cargo` that is not an option
+/// for the subcommand (`cargo_subcommand` without `CARGO_GLOBAL_VALUED`) and
+/// these lines are held for review only.
+#[test]
+fn cargos_own_options_before_run_do_not_hide_the_package_it_runs() {
+    check(
+        &[
+            "cargo --color always run -p innerwarden -- $V",
+            "cargo -C /src/proj run -p innerwarden -- $V",
+            "cargo --config x=1 run -p innerwarden -- $V",
+            "cargo --manifest-path /src/x/Cargo.toml run -p innerwarden -- $V",
+            "cargo -Z unstable-options run -p innerwarden -- $V",
+            "cargo -j 4 run -p innerwarden -- $V",
+            "cargo --jobs 4 run -p innerwarden -- $V",
+            "cargo --target-dir /tmp/t run -p innerwarden -- $V",
+            "cargo +stable --color always run -p innerwarden -- $V",
+        ],
+        "deny",
+    );
+    check(&["cargo -C /src/proj build -p innerwarden"], "allow");
+}
+
+/// What an ssh client runs on this host from its own options (`ProxyCommand`,
+/// `LocalCommand`, `KnownHostsCommand`, `Match exec`) is a command line where
+/// a program runs, for `ssh`, `scp` and `sftp` and the `ssh` that `rsync -e`
+/// runs, with `-o` glued or apart and `=` or a space.
+///
+/// FAILS ON REVERT: read no option of the ssh client as a command
+/// (`ssh_local_commands` answering nothing) and the `scp`, `sftp -o` glued
+/// and `rsync` lines with `$V` are held for review only, and `scp -o
+/// ProxyCommand="innerwarden allow x"` is let through.
+#[test]
+fn a_command_an_ssh_client_runs_from_its_options_is_where_a_program_runs() {
+    check(
+        &[
+            "scp -o ProxyCommand=\"innerwarden $V\" x h1:y",
+            "scp -O -o ProxyCommand=\"innerwarden $V\" x h1:y",
+            "scp -J h2 -o ProxyCommand=\"$HOME/.local/bin/innerwarden $V\" x h1:y",
+            "scp -o KnownHostsCommand=\"innerwarden $V\" x h1:y",
+            "scp -o PermitLocalCommand=yes -o LocalCommand=\"innerwarden $V\" x h1:y",
+            "scp -oProxyCommand=\"innerwarden $V\" x h1:y",
+            "scp -o \"ProxyCommand innerwarden $V\" x h1:y",
+            "sftp -oProxyCommand=\"innerwarden $V\" h1",
+            "rsync -e \"ssh -o ProxyCommand='innerwarden $V'\" x h1:y",
+            "scp -o ProxyCommand=\"innerwarden allow x\" x h1:y",
+            "rsync -e \"ssh -o ProxyCommand='innerwarden monitor'\" x h1:y",
+            "sftp -o \"LocalCommand innerwarden mute x\" -o PermitLocalCommand=yes h1",
+        ],
+        "deny",
+    );
+    check(
+        &[
+            "scp -o ProxyCommand=\"ssh -W %h:%p jump\" x h1:y",
+            "scp -o ConnectTimeout=5 x h1:y",
+            "rsync -e \"ssh -o ProxyCommand='ssh -W %h:%p jump'\" x h1:y",
+        ],
+        "allow",
+    );
+}
+
+/// The guard's program found by a substitution that prints its path, then
+/// moved, removed, overwritten, linked over or changed, is refused as the
+/// path written out is. A copy from it, a listing or a hash of it reads it.
+///
+/// FAILS ON REVERT: leave `found_guard_program_changed` out of
+/// `check_guard_takedown` and these lines are held for review only.
+#[test]
+fn the_guards_program_found_by_a_substitution_and_moved_is_refused() {
+    check(
+        &[
+            "mv \"$(which innerwarden)\" /tmp/x",
+            "mv \"$(command -v innerwarden)\" /tmp/x",
+            "mv \"`which innerwarden`\" /tmp/x",
+            "mv \"$(type -P innerwarden)\" /tmp/x",
+            "mv \"$(readlink -f \"$(which innerwarden)\")\" /tmp/x",
+            "mv \"$(which innerwarden)\"{,.off}",
+            "mv \"$(command -v innerwarden)\" \"$(command -v innerwarden).bak\"",
+            "mv /tmp/x \"$(which innerwarden)\"",
+            "rm -f \"$(which innerwarden)\"",
+            "cp /bin/true \"$(which innerwarden)\"",
+            "ln -sf /bin/true \"$(which innerwarden)\"",
+            "chmod 000 \"$(which innerwarden)\"",
+            "truncate -s0 \"$(which innerwarden)\"",
+            ": > \"$(which innerwarden)\"",
+            "echo x | tee \"$(command -v innerwarden)\"",
+        ],
+        "deny",
+    );
+    check(
+        &[
+            "ls -la \"$(which innerwarden)\"",
+            "sha256sum \"$(command -v innerwarden)\"",
+        ],
+        "allow",
+    );
+    let copy = analyze_command("cp \"$(which innerwarden)\" /tmp/iw-copy", None);
+    assert_ne!(copy.recommendation, "deny", "{:?}", copy.signals);
+}

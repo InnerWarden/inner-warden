@@ -8,7 +8,13 @@
 # gle-031 the guard named behind a launcher or as an option's value with a
 # loosening verb written after it (`taskset`, `flock`, `setsid`, `stdbuf`,
 # `systemd-run`, `cargo run -p`, `rtk`), which a reading of the guard's name
-# only where a program runs must keep refusing.
+# only where a program runs must keep refusing; from gle-040 the same reading
+# met with the name glued to cargo's option (`--bin=`, `--package=`, `-p`),
+# cargo's own options before `run`, a command an ssh client runs on this host
+# (`ProxyCommand`, `LocalCommand`, `KnownHostsCommand`, `Match exec`) given to
+# `scp`, `sftp` or `rsync -e`, and the guard's program found by a
+# substitution (`which`, `command -v`, `type -P`, `readlink -f`) and moved,
+# removed, overwritten or changed.
 #
 # `must_refuse: true` lines stop, kill or turn off the guard, or run it in a
 # way that lowers it. `expect: deny`: only a refusal counts as caught. The
@@ -298,6 +304,152 @@ cases:
     input: "rtk err innerwarden uninstall"
     must_refuse: true
     expect: deny
+  # From gle-040: refused by main 550e755f, each to be refused by the reading
+  # of the guard's name only where a program runs as well.
+  - id: gle-040
+    category: cargo_glued_program
+    label: malicious
+    input: "cargo run --bin=innerwarden -- agent kernel off"
+    must_refuse: true
+    expect: deny
+  - id: gle-041
+    category: cargo_glued_program
+    label: malicious
+    input: "cargo run --package=innerwarden -- agent kernel off"
+    must_refuse: true
+    expect: deny
+  - id: gle-042
+    category: cargo_glued_program
+    label: malicious
+    input: "cargo run -pinnerwarden -- agent kernel off"
+    must_refuse: true
+    expect: deny
+  - id: gle-043
+    category: cargo_global_option_value
+    label: malicious
+    input: "cargo --color always run -p innerwarden -- $V"
+    must_refuse: true
+    expect: deny
+  - id: gle-044
+    category: cargo_global_option_value
+    label: malicious
+    input: "cargo -C /src/proj run -p innerwarden -- $V"
+    must_refuse: true
+    expect: deny
+  - id: gle-045
+    category: cargo_global_option_value
+    label: malicious
+    input: "cargo --manifest-path /src/x/Cargo.toml run -p innerwarden -- $V"
+    must_refuse: true
+    expect: deny
+  - id: gle-046
+    category: cargo_global_option_value
+    label: malicious
+    input: "cargo -j 4 run -p innerwarden -- $V"
+    must_refuse: true
+    expect: deny
+  - id: gle-047
+    category: ssh_option_runs_a_command
+    label: malicious
+    input: "scp -o ProxyCommand=\"innerwarden $V\" x h1:y"
+    must_refuse: true
+    expect: deny
+  - id: gle-048
+    category: ssh_option_runs_a_command
+    label: malicious
+    input: "scp -o KnownHostsCommand=\"innerwarden $V\" x h1:y"
+    must_refuse: true
+    expect: deny
+  - id: gle-049
+    category: ssh_option_runs_a_command
+    label: malicious
+    input: "scp -o PermitLocalCommand=yes -o LocalCommand=\"innerwarden $V\" x h1:y"
+    must_refuse: true
+    expect: deny
+  - id: gle-050
+    category: ssh_option_runs_a_command
+    label: malicious
+    input: "rsync -e \"ssh -o ProxyCommand='innerwarden $V'\" x h1:y"
+    must_refuse: true
+    expect: deny
+  - id: gle-051
+    category: guard_program_moved
+    label: malicious
+    input: "mv \"$(command -v innerwarden)\" /tmp/x"
+    must_refuse: true
+    expect: deny
+  - id: gle-052
+    category: guard_program_moved
+    label: malicious
+    input: "mv \"`which innerwarden`\" /tmp/x"
+    must_refuse: true
+    expect: deny
+  - id: gle-053
+    category: guard_program_moved
+    label: malicious
+    input: "mv \"$(which innerwarden)\"{,.off}"
+    must_refuse: true
+    expect: deny
+  - id: gle-054
+    category: guard_program_moved
+    label: malicious
+    input: "rm -f \"$(which innerwarden)\""
+    must_refuse: true
+    expect: deny
+  - id: gle-055
+    category: guard_program_moved
+    label: malicious
+    input: "cp /bin/true \"$(which innerwarden)\""
+    must_refuse: true
+    expect: deny
+  - id: gle-056
+    category: guard_program_moved
+    label: malicious
+    input: "ln -sf /bin/true \"$(which innerwarden)\""
+    must_refuse: true
+    expect: deny
+  - id: gle-057
+    category: guard_program_moved
+    label: malicious
+    input: "chmod 000 \"$(type -P innerwarden)\""
+    must_refuse: true
+    expect: deny
+  - id: gle-058
+    category: guard_program_moved
+    label: malicious
+    input: "mv \"$(readlink -f \"$(which innerwarden)\")\" /tmp/x"
+    must_refuse: true
+    expect: deny
+  - id: gle-059
+    category: cargo_glued_program
+    label: malicious
+    input: "cargo run --bin=innerwarden -- allow foo"
+    must_refuse: true
+    expect: deny
+  - id: gle-060
+    category: cargo_glued_program
+    label: malicious
+    input: "cargo run --bin=innerwarden -- --self-approve x"
+    must_refuse: true
+    expect: deny
+  - id: gle-061
+    category: ssh_option_runs_a_command
+    label: malicious
+    input: "scp -o ProxyCommand=\"innerwarden allow x\" x h1:y"
+    must_refuse: true
+    expect: deny
+  - id: gle-062
+    category: ssh_option_runs_a_command
+    label: malicious
+    input: "sftp -oProxyCommand=\"innerwarden $V\" h1"
+    must_refuse: true
+    expect: deny
+  - id: gle-063
+    category: cargo_global_option_value
+    label: malicious
+    input: "cargo +stable --color always run -p innerwarden -- $V"
+    must_refuse: true
+    expect: deny
   # 1.6.15: allow (no rule matched)
   - id: gle-c01
     category: control
@@ -339,4 +491,34 @@ cases:
     category: control
     label: benign
     input: "killall firefox"
+    expect: allow
+  - id: gle-c08
+    category: control
+    label: benign
+    input: "scp -o ProxyCommand=\"ssh -W %h:%p jump\" x h1:y"
+    expect: allow
+  - id: gle-c09
+    category: control
+    label: benign
+    input: "rsync -e \"ssh -o ProxyCommand='ssh -W %h:%p jump'\" x h1:y"
+    expect: allow
+  - id: gle-c10
+    category: control
+    label: benign
+    input: "cargo run --bin=mytool -- status"
+    expect: allow
+  - id: gle-c11
+    category: control
+    label: benign
+    input: "cargo -C /src/proj build -p innerwarden"
+    expect: allow
+  - id: gle-c12
+    category: control
+    label: benign
+    input: "sha256sum \"$(command -v innerwarden)\""
+    expect: allow
+  - id: gle-c13
+    category: control
+    label: benign
+    input: "ls -la \"$(which innerwarden)\""
     expect: allow

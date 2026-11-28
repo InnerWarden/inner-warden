@@ -506,16 +506,16 @@ impl WordsAfter {
     }
 
     /// What the words from place `from` on write out after a word that may
-    /// name a guard program where no program runs (an argument): `agent
-    /// kernel` right after it and a word that is not a read, a kernel guard
-    /// and a verb that lowers it, `lsm --apply`, `disarm` or
-    /// `--self-approve`. A word the text does not show, or words a program
-    /// before it adds, are not read as the verb there: an argument is a
-    /// mention unless what lowers the guard is written after it.
+    /// name a guard program where no program runs (an argument): `agent`
+    /// and `kernel` anywhere after it and a word after them that is not a
+    /// read, a kernel guard and a verb that lowers it, `lsm --apply`,
+    /// `disarm` or `--self-approve`. A word the text does not show, or words
+    /// a program before it adds, are not read as the verb there: an argument
+    /// is a mention unless what lowers the guard is written after it.
     pub(super) fn found_written(&self, program: GuardProgram, from: usize) -> bool {
         match (&self.kept, program) {
             (_, GuardProgram::Not) => false,
-            (Kept::Kernel(held), _) => self.guard_verbs_after_any_program(held, from),
+            (Kept::Kernel(held), _) => self.kernel_verbs_written_after(held, from),
             (Kept::ExecGate(held), _) => {
                 held[from].lowered_written || held[from].lsm_place[0] == LSM_APPLIED
             }
@@ -570,6 +570,20 @@ impl WordsAfter {
                 || held[kernel].not_plain_before > held[from].not_plain_before
                 || held[kernel + 1].not_a_read,
         )
+    }
+
+    /// `agent`, then `kernel`, each as written anywhere from place `from` on,
+    /// then a word after them that is not a read
+    /// ([`KERNEL_PROTECTION_READS`]). Asked only right after the name (past
+    /// its options), the verb written further on was not read: `cargo run
+    /// --bin=innerwarden -- agent kernel off` has `--` between them.
+    fn kernel_verbs_written_after(&self, held: &[KernelPlace], from: usize) -> bool {
+        let agent = held[from].agent;
+        if agent == self.count {
+            return false;
+        }
+        let kernel = held[agent + 1].kernel;
+        kernel != self.count && held[kernel + 1].not_a_read
     }
 
     /// `agent` and `kernel` as written right after a program (options, and

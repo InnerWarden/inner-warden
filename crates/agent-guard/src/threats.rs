@@ -3665,6 +3665,9 @@ pub(crate) fn check_guard_takedown(content: &str) -> Option<(&'static str, u32)>
     if guard_file_targets::removal_reaches_guard_file(content) {
         return Some((guard_file_targets::GUARD_FILE_REACHED, 60));
     }
+    if guard_file_targets::found_guard_program_changed(content) {
+        return Some((guard_file_targets::FOUND_GUARD_PROGRAM_CHANGED, 60));
+    }
     guard_takedown::programs_searches_run(content)
         .iter()
         .find_map(|line| {
@@ -4380,7 +4383,20 @@ impl Look {
         };
         match (self, program) {
             (_, GuardProgram::Not) => false,
-            (Look::Kernel, _) => guard_verbs_after_any_program(arguments),
+            (Look::Kernel, _) => arguments
+                .iter()
+                .position(|word| says(word, "agent"))
+                .and_then(|agent| {
+                    arguments[agent + 1..]
+                        .iter()
+                        .position(|word| says(word, "kernel"))
+                        .map(|kernel| agent + 1 + kernel)
+                })
+                .is_some_and(|kernel| {
+                    arguments[kernel + 1..].iter().any(|word| {
+                        !(word.is_plain() && KERNEL_PROTECTION_READS.contains(&word.text.as_str()))
+                    })
+                }),
             (Look::ExecGate, _) => {
                 arguments.iter().enumerate().any(|(at, word)| {
                     words_after::KERNEL_GUARDS
@@ -4642,7 +4658,7 @@ fn guard_words_found_within(
                     before.read(word, at.checked_sub(1).map(|last| &words[last]));
                     continue;
                 }
-                let program = guard_program(word, &names, &assigned);
+                let program = guard_program_or_glued(word, &names, &assigned);
                 for (look, after) in &after {
                     let read_whole =
                         || after.found(program, at + 1, before.fed(), later, runs_here);
@@ -4672,6 +4688,12 @@ fn guard_words_found_within(
         if words.iter().any(|word| !word.substitutions.is_empty()) {
             let (shown, shown_places) = words_with_substitutions_shown(words, &places);
             found = found.with(found_in(&shown, &shown_places, looks.without(found)));
+        }
+        // What an ssh client's `-o` options run on this host is a command
+        // line of its own, where a program runs
+        // ([`program_places::ssh_local_commands`]).
+        for local in program_places::ssh_local_commands_of(words) {
+            found = found.with(run_as_text(&local, later, runs_here, looks.without(found)));
         }
         // What a value holds becomes words of this command, or text it
         // hands on. At the last level read its words are not walked: one
@@ -4837,7 +4859,7 @@ fn guard_words_in_afresh_within(
                     before.read(word, at.checked_sub(1).map(|last| &words[last]));
                     return false;
                 }
-                let program = guard_program(word, &names, &assigned);
+                let program = guard_program_or_glued(word, &names, &assigned);
                 let read_whole = || after.found(program, at + 1, before.fed(), later, runs_here);
                 let found = match place {
                     WordPlace::Program | WordPlace::Any => read_whole(),
@@ -4861,6 +4883,12 @@ fn guard_words_in_afresh_within(
             if found_in(&shown, &shown_places) {
                 return true;
             }
+        }
+        if program_places::ssh_local_commands_of(words)
+            .iter()
+            .any(|local| run_as_text(local, later, runs_here))
+        {
+            return true;
         }
         // What a value holds becomes words of this command, or text it
         // hands on.
@@ -4954,7 +4982,11 @@ fn hands_its_text_to_a_shell(words: &[crate::shell_words::Word]) -> bool {
 /// `-xvalue` after one to four option letters (`-O<command>`,
 /// `-nO<command>`).
 fn attached_option_values(word: &crate::shell_words::Word) -> Vec<&str> {
-    let text = word.text.as_str();
+    attached_option_values_of(&word.text)
+}
+
+/// [`attached_option_values`] of a word's text.
+fn attached_option_values_of(text: &str) -> Vec<&str> {
     if let Some(long) = text.strip_prefix("--") {
         return long
             .split_once('=')
@@ -5041,6 +5073,36 @@ fn guard_program(
         }
     }
     found
+}
+
+/// [`guard_program`], an option's value glued on read as the word it would
+/// be on its own: `--bin=innerwarden` and `-pinnerwarden` name the guard as
+/// `--bin innerwarden` and `-p innerwarden` do. Read as a word of its own
+/// only, `cargo run --bin=innerwarden -- agent kernel off` named no guard
+/// program and was let through.
+fn guard_program_or_glued(
+    word: &crate::shell_words::Word,
+    names: &GuardNames,
+    assigned: &ValuesAssigned,
+) -> GuardProgram {
+    let program = guard_program(word, names, assigned);
+    if !matches!(program, GuardProgram::Not) || !word.is_plain() || !word.text.starts_with('-') {
+        return program;
+    }
+    let names_one = attached_option_values(word).into_iter().any(|value| {
+        if !glued_value_may_name_a_program(&word.text, value) {
+            return false;
+        }
+        let lower = value.to_ascii_lowercase();
+        let last = lower.rsplit('/').next().unwrap_or(&lower);
+        let bare = last.strip_suffix(".exe").unwrap_or(last);
+        GUARD_PROGRAMS.contains(&bare) || names.contains(bare)
+    });
+    if names_one {
+        GuardProgram::Is
+    } else {
+        GuardProgram::Not
+    }
 }
 
 /// The search for the word where a kernel guard's verb is: the first word
@@ -6837,6 +6899,20 @@ fn words_run_guard_loosening_verb_fed(
             after_option = true;
             continue;
         }
+        // What an ssh client runs on this host from its `-o` options, and the
+        // remote shell `rsync -e` runs: command lines of their own
+        // ([`program_places::ssh_local_commands`]).
+        if program_places::SSH_FAMILY.contains(&base) || base == "rsync" {
+            let arguments: Vec<&str> = rest.iter().map(String::as_str).collect();
+            let mut local = program_places::ssh_local_commands(base, &arguments);
+            local.extend(program_places::rsync_remote_shell(base, &arguments));
+            if local
+                .into_iter()
+                .any(|line| runs_guard_loosening_verb_in(line, depth + 1, budget))
+            {
+                return true;
+            }
+        }
         // A program that runs code or a command line it is handed (an
         // interpreter, a remote or container exec): the verb inside the text
         // it is given is run by it, whatever the quoting.
@@ -7112,17 +7188,12 @@ fn uninstall_only_asks(lower: &str) -> bool {
 /// `iw 2>x` took 1.4 s on the lab box (2026-11-10).
 fn guard_cli_named_later_loosens(words: &[String], budget: &ReadingBudget) -> bool {
     let mut without: Option<(Vec<String>, Vec<usize>)> = None;
+    let mut first_name: Option<usize> = None;
     for (index, word) in words.iter().enumerate() {
-        let lower = word.to_ascii_lowercase();
-        let base = token_basename(lower.trim_matches('`'));
-        let base = base.strip_suffix(".exe").unwrap_or(base);
-        let loosens: fn(&[String]) -> bool = if is_guard_cli_name(base) {
-            guard_verb_loosens
-        } else if base == "innerwarden-ctl" {
-            ctl_verb_loosens
-        } else {
+        let Some(loosens) = guard_cli_named_by(word) else {
             continue;
         };
+        first_name.get_or_insert(index);
         if !budget.spend(words.len() - index) {
             return false;
         }
@@ -7138,7 +7209,77 @@ fn guard_cli_named_later_loosens(words: &[String], budget: &ReadingBudget) -> bo
             return true;
         }
     }
+    // A verb that loosens the guard, written anywhere after a word that
+    // names it, not only right after: `cargo run --bin=innerwarden --release
+    // -- allow x`. Read with the redirections and their targets taken out:
+    // the file a redirection names is no verb (`iw > allow x`).
+    let Some(first) = first_name else {
+        return false;
+    };
+    let (kept, before) = without.get_or_insert_with(|| without_redirections(words));
+    loosening_verb_written_from(&kept[before[first + 1]..], budget)
+}
+
+/// The verbs of the guard's CLI that loosen it, as written after a word that
+/// names the guard where no program of it runs (an argument, an option's
+/// value): each is the guard's own command, wherever the name stands.
+const WRITTEN_LOOSENING_VERBS: &[&str] = &["allow", "mute", "monitor", "dry-run", "uninstall"];
+
+/// Whether one of [`WRITTEN_LOOSENING_VERBS`] stands among `words` with what
+/// makes it loosen after it ([`guard_verb_loosens`]: `allow --list` reads).
+/// Each verb found pays for the words after it from `budget`.
+fn loosening_verb_written_from(words: &[String], budget: &ReadingBudget) -> bool {
+    for (at, word) in words.iter().enumerate() {
+        let lower = word.to_ascii_lowercase();
+        if !WRITTEN_LOOSENING_VERBS.contains(&lower.as_str()) {
+            continue;
+        }
+        if !budget.spend(words.len() - at) {
+            return false;
+        }
+        if guard_verb_loosens(&words[at..]) {
+            return true;
+        }
+    }
     false
+}
+
+/// What reads the arguments after `word` when it names one of the guard's
+/// programs: [`guard_verb_loosens`] for the CLI by any of its names and
+/// paths, [`ctl_verb_loosens`] for Active Defence's ctl. An option with the
+/// name glued on as its value (`--bin=innerwarden`, `-pinnerwarden`) names
+/// it as the two words would.
+fn guard_cli_named_by(word: &str) -> Option<fn(&[String]) -> bool> {
+    let lower = word.to_ascii_lowercase();
+    let trimmed = lower.trim_matches('`');
+    let named = |text: &str| -> Option<fn(&[String]) -> bool> {
+        let base = token_basename(text);
+        let base = base.strip_suffix(".exe").unwrap_or(base);
+        if is_guard_cli_name(base) {
+            Some(guard_verb_loosens)
+        } else if base == "innerwarden-ctl" {
+            Some(ctl_verb_loosens)
+        } else {
+            None
+        }
+    };
+    named(trimmed).or_else(|| {
+        if !trimmed.starts_with('-') {
+            return None;
+        }
+        attached_option_values_of(trimmed)
+            .into_iter()
+            .filter(|value| glued_value_may_name_a_program(trimmed, value))
+            .find_map(named)
+    })
+}
+
+/// Whether `value`, glued to the option `option`, may be a program's name:
+/// any value of a long option, and of a cluster of short ones a value that
+/// is not the installer's two-letter `iw`, which ends flag clusters
+/// (`-aiw`, `-liw`) far more often than it names a program.
+fn glued_value_may_name_a_program(option: &str, value: &str) -> bool {
+    option.starts_with("--") || value != "iw"
 }
 
 /// `words` with every redirection and its target taken out, and for each
@@ -34086,9 +34227,18 @@ mod named_later_tests {
     /// The reading as it was before the words were read once for all the
     /// names: what is left of the words after each name, read afresh.
     fn named_later_loosens_afresh(words: &[String]) -> bool {
-        names(words)
-            .into_iter()
-            .any(|(index, loosens)| guard_arguments_loosen(&words[index + 1..], loosens))
+        names(words).into_iter().any(|(index, loosens)| {
+            let after = &words[index + 1..];
+            guard_arguments_loosen(after, loosens) || {
+                // A loosening verb written anywhere after the name, the
+                // redirections taken out.
+                let kept = without_redirections(after).0;
+                (0..kept.len()).any(|at| {
+                    WRITTEN_LOOSENING_VERBS.contains(&kept[at].to_ascii_lowercase().as_str())
+                        && guard_verb_loosens(&kept[at..])
+                })
+            }
+        })
     }
 
     /// The reading under test, on a line short enough to be read whole.
