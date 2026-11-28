@@ -534,20 +534,23 @@ fn fill(words: &[Word], from: usize, to: usize, places: &mut [WordPlace]) {
         "find" | "fd" | "fdfind" if runs_the_found_file(&words[after..to]) => {}
         "find" => {
             set(places, WordPlace::Data);
-            let mut index = after;
-            while index < to {
-                let word = &words[index];
-                index += 1;
-                if !(word.is_plain()
-                    && matches!(word.text.as_str(), "-exec" | "-execdir" | "-ok" | "-okdir"))
-                {
-                    continue;
-                }
-                let end = (index..to)
+            // Each command an `-exec` runs, up to its `;` or `+`. Read by
+            // search, not by a counter stepped one by one: a counter that
+            // stops stepping would never end the reading.
+            let mut from = after;
+            while let Some(exec) = (from..to).find(|&j| {
+                words[j].is_plain()
+                    && matches!(
+                        words[j].text.as_str(),
+                        "-exec" | "-execdir" | "-ok" | "-okdir"
+                    )
+            }) {
+                let start = exec + 1;
+                let end = (start..to)
                     .find(|&j| matches!(words[j].text.as_str(), ";" | "+"))
                     .unwrap_or(to);
-                fill(words, index, end, places);
-                index = end;
+                fill(words, start, end, places);
+                from = end;
             }
         }
         "fd" | "fdfind" => {
@@ -619,20 +622,19 @@ fn runs_the_found_file(words: &[Word]) -> bool {
 /// none is left.
 fn ssh_command_start(words: &[Word]) -> Option<usize> {
     let mut options = true;
-    let mut index = 0;
-    while let Some(word) = words.get(index) {
+    let mut rest = words.iter().enumerate();
+    while let Some((index, word)) = rest.next() {
         let text = word.text.as_str();
         if options && text == "--" {
             options = false;
-            index += 1;
             continue;
         }
         if options && text.len() > 1 && text.starts_with('-') {
-            index += 1;
             let letters = &text[1..];
             if let Some(at) = letters.find(|c| SSH_VALUED.contains(c)) {
                 if letters[at + 1..].is_empty() {
-                    index += 1;
+                    // Its value is the next word.
+                    rest.next();
                 }
             }
             continue;
@@ -646,8 +648,8 @@ fn ssh_command_start(words: &[Word]) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::{
-        cargo_run_program_glued, cargo_subcommand, places, rsync_remote_shell, ssh_local_commands,
-        WordPlace,
+        arguments_of, cargo_run_program_glued, cargo_run_program_option, cargo_subcommand, places,
+        rsync_remote_shell, ssh_command_start, ssh_local_commands, Arguments, WordPlace,
     };
 
     fn read(line: &str) -> Vec<(String, WordPlace)> {
@@ -850,5 +852,134 @@ mod tests {
         ] {
             assert_eq!(rsync_remote_shell("rsync", words), shell, "{words:?}");
         }
+    }
+
+    /// What each program does with its arguments, for each word that makes
+    /// it run one and without it.
+    ///
+    /// FAILS ON REVERT: take the arm of `find`, `fd` or `ssh` out of
+    /// `arguments_of`, or read the words of `git` that run a command as all
+    /// of them at once, and the line of that program reads as data.
+    #[test]
+    fn what_a_program_does_with_its_arguments() {
+        for (program, words, expected) in [
+            (
+                "find",
+                &["/opt", "-name", "x", "-exec", "y", ";"][..],
+                Arguments::Run,
+            ),
+            ("find", &["/opt", "-okdir", "y", ";"][..], Arguments::Run),
+            ("find", &["/opt", "-name", "x"][..], Arguments::Data),
+            ("fd", &["x", "--exec-batch", "y"][..], Arguments::Run),
+            ("fdfind", &["x", "-X", "y"][..], Arguments::Run),
+            ("fd", &["x", "/opt"][..], Arguments::Data),
+            ("ssh", &["h1"][..], Arguments::Run),
+            ("git", &["-c", "x=y", "log"][..], Arguments::Run),
+            ("git", &["log", "!x"][..], Arguments::Run),
+            ("git", &["--exec-path=/x", "log"][..], Arguments::Run),
+            ("git", &["log", "--oneline"][..], Arguments::Data),
+            ("rg", &["--pre", "x", "y"][..], Arguments::Run),
+            ("rg", &["x"][..], Arguments::Data),
+            ("printf", &["-v", "x", "y"][..], Arguments::Run),
+            ("printf", &["%s", "y"][..], Arguments::Data),
+            ("cargo", &["--color", "always", "run"][..], Arguments::Run),
+            ("cargo", &["test"][..], Arguments::Data),
+            ("./run", &["x"][..], Arguments::Unknown),
+            ("innerwarden", &["x"][..], Arguments::Run),
+            ("bash", &["x"][..], Arguments::Run),
+            ("export", &["X=1"][..], Arguments::Run),
+            ("read", &["X"][..], Arguments::Run),
+            ("watch", &["x"][..], Arguments::Run),
+        ] {
+            assert_eq!(
+                arguments_of(program, words),
+                expected,
+                "{program} {words:?}"
+            );
+        }
+    }
+
+    /// Only a cluster of letters ending in `p`, none of them an option that
+    /// takes a value of its own, waits for the package as the next word,
+    /// and a digit ends a cluster that would glue it on.
+    ///
+    /// FAILS ON REVERT: answer `cargo_run_program_option` `true`, or join
+    /// its conditions with `||`, and a flag or a cluster that is not one
+    /// gives the next word as the package; take any character for a letter
+    /// in `cargo_run_program_glued` and `-1pX` glues one on.
+    #[test]
+    fn only_an_option_that_takes_the_package_takes_it() {
+        for text in ["-p", "--package", "--bin", "--example", "-qp", "-vqp"] {
+            assert!(cargo_run_program_option(text), "{text}");
+        }
+        for text in ["--release", "-q", "-pq", "--p", "-1p", "-jp", "-Fp", "-"] {
+            assert!(!cargo_run_program_option(text), "{text}");
+        }
+        assert_eq!(cargo_run_program_glued("-1pinnerwarden"), None);
+        assert_eq!(cargo_run_program_glued("-jpinnerwarden"), None);
+        assert_eq!(cargo_run_program_glued("-Zpx"), None);
+    }
+
+    /// An option of `cargo run` that waits for the package as the last word
+    /// of the command, a `{}` the search hands the found file to whole or a
+    /// value in its place, and a `--` before the host of `ssh`.
+    ///
+    /// FAILS ON REVERT: let `fill` mark the word past the last one
+    /// (`j - 1 < to`, `j + 1 <= to`) and the first line panics; join the two
+    /// readings of `runs_the_found_file` with `&&` and the found file run by
+    /// a quoted `{}` or a value is read as a search; step back at `--` in
+    /// `ssh_command_start` and the `ssh` line panics.
+    #[test]
+    fn the_edges_of_where_a_program_runs() {
+        assert_eq!(place_of("cargo run -p", "-p"), WordPlace::Data);
+        assert_eq!(place_of("cargo run --bin", "--bin"), WordPlace::Data);
+        for (line, word) in [
+            (
+                "find /usr/local/bin -name innerwarden -exec '{}' monitor ;",
+                "innerwarden",
+            ),
+            ("fd innerwarden /opt -x $X monitor", "innerwarden"),
+        ] {
+            assert_eq!(place_of(line, word), WordPlace::Any, "{line}");
+        }
+        assert_eq!(
+            place_of("fd ';' -x innerwarden status", "innerwarden"),
+            WordPlace::Program
+        );
+        assert_eq!(
+            place_of("ssh -- h1 innerwarden status", "innerwarden"),
+            WordPlace::Program
+        );
+    }
+
+    /// Where the command `ssh` hands the far shell starts: past its
+    /// options, an option's value given apart, `--` and the host; a lone `-`
+    /// is no option.
+    ///
+    /// FAILS ON REVERT: take a lone `-` for an option (`len() >= 1`), or
+    /// leave the value of `-p 22` among the words, and the start moves.
+    #[test]
+    fn where_the_command_ssh_runs_starts() {
+        let words = |line: &str| {
+            crate::shell_words::read_line(line).commands[0]
+                .words
+                .clone()
+        };
+        for (line, start) in [
+            ("h1", None),
+            ("h1 x", Some(1)),
+            ("-p 22 h1 x", Some(3)),
+            ("-p22 h1 x", Some(2)),
+            ("-4 h1 x", Some(2)),
+            ("-- h1 x", Some(2)),
+            ("- x", Some(1)),
+            ("-o X=1 h1", None),
+        ] {
+            assert_eq!(ssh_command_start(&words(line)), start, "{line}");
+        }
+        assert_eq!(
+            place_of("ssh - innerwarden status", "innerwarden"),
+            WordPlace::Program
+        );
     }
 }

@@ -26101,15 +26101,19 @@ const RTK_OWN: &[&str] = &[
 /// through a shell (`run -c`, `--shell`), runs none (`--version`, its own
 /// subcommands, [`RTK_OWN`]) or an option is not one it takes.
 fn rtk_command_start(words: &[String], at: usize) -> Option<usize> {
-    let mut index = at + 1;
-    while let Some(word) = words.get(index) {
-        let verbose =
-            word.len() > 1 && word.starts_with('-') && word[1..].chars().all(|c| c == 'v');
-        if !(verbose || matches!(word.as_str(), "--verbose" | "--skip-env")) {
-            break;
-        }
-        index += 1;
-    }
+    // rtk's own flags, counted rather than stepped past one by one: a
+    // counter that stops stepping would never end the reading.
+    let own_flags = words
+        .get(at + 1..)
+        .unwrap_or_default()
+        .iter()
+        .take_while(|word| {
+            let verbose =
+                word.len() > 1 && word.starts_with('-') && word[1..].chars().all(|c| c == 'v');
+            verbose || matches!(word.as_str(), "--verbose" | "--skip-env")
+        })
+        .count();
+    let index = at + 1 + own_flags;
     let subcommand = words.get(index)?;
     if word_is_an_option(subcommand) || RTK_OWN.contains(&subcommand.as_str()) {
         return None;
@@ -26117,21 +26121,17 @@ fn rtk_command_start(words: &[String], at: usize) -> Option<usize> {
     if !RTK_RUNNERS.contains(&subcommand.as_str()) {
         return Some(index);
     }
-    index += 1;
-    while let Some(word) = words.get(index) {
+    for (place, word) in words.iter().enumerate().skip(index + 1) {
         match word.as_str() {
-            "--" => {
-                index += 1;
-                break;
-            }
-            "--skip-env" => index += 1,
-            "-c" | "--command" | "--shell" => return None,
-            _ if word.starts_with("--command=") || word.starts_with("--shell=") => return None,
+            "--" => return (place + 1 < words.len()).then_some(place + 1),
+            "--skip-env" => {}
+            // `-c`, `--command` and `--shell` run a string through a shell,
+            // and any other option is not one a runner takes.
             _ if word.starts_with('-') => return None,
-            _ => break,
+            _ => return Some(place),
         }
     }
-    (index < words.len()).then_some(index)
+    None
 }
 
 /// A word written as an option: `-x`, `--name`.
@@ -36892,6 +36892,10 @@ mod mutant_kills_t11;
 #[cfg(test)]
 #[path = "mutant_kills/threats_t12.rs"]
 mod mutant_kills_t12;
+
+#[cfg(test)]
+#[path = "mutant_kills/threats_t13.rs"]
+mod mutant_kills_t13;
 
 #[cfg(test)]
 mod rm_readings_kept {

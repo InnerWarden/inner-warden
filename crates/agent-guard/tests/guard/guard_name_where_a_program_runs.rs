@@ -430,3 +430,38 @@ fn the_guards_program_found_by_a_substitution_and_moved_is_refused() {
     let copy = analyze_command("cp \"$(which innerwarden)\" /tmp/iw-copy", None);
     assert_ne!(copy.recommendation, "deny", "{:?}", copy.signals);
 }
+
+/// A read of the guard's store is charged once, with its own reason: on
+/// this host, and on another host where the line `ssh` runs holds it.
+///
+/// FAILS ON REVERT: take every finding seen on the remote line for one
+/// charged already (`indicator == GUARD_STORE_READ || ...` in
+/// `analyze_command_as_read`) and the `pkill` on another host is charged
+/// once.
+#[test]
+fn a_read_of_the_guards_store_is_charged_once_with_its_reason() {
+    for line in [
+        "cat /var/lib/innerwarden/decisions-2026-11-27.jsonl",
+        "ssh h1 'cat /var/lib/innerwarden/decisions-2026-11-27.jsonl'",
+    ] {
+        let analysis = analyze_command(line, None);
+        let charged: Vec<_> = analysis
+            .signals
+            .iter()
+            .filter(|signal| {
+                signal.signal == "security_tooling_tamper"
+                    && signal.detail.contains("reads the guard's own store")
+            })
+            .collect();
+        assert_eq!(charged.len(), 1, "{line}: {:?}", analysis.signals);
+    } // Any other tamper finding of the remote line stands there and in the
+      // line read whole.
+    let line = "ssh h1 'pkill -f innerwarden'";
+    let analysis = analyze_command(line, None);
+    let tampers = analysis
+        .signals
+        .iter()
+        .filter(|signal| signal.signal == "security_tooling_tamper")
+        .count();
+    assert_eq!(tampers, 2, "{line}: {:?}", analysis.signals);
+}

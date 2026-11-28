@@ -1690,3 +1690,231 @@ pub(super) fn judge(text: &[u8], flat: bool) -> Option<String> {
         .context(&lexed, 0)
         .or_else(|| judge.held.map(|reason| format!("held:{reason}")))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn given(text: &str) -> std::collections::HashMap<String, Option<String>> {
+        values_given(&Lexer::read(text.as_bytes()).commands)
+            .into_iter()
+            .map(|(name, value)| (name, value.map(|(_, word)| word.lit)))
+            .collect()
+    }
+
+    fn value(text: &str, name: &str) -> Option<String> {
+        given(text).get(name).cloned().flatten()
+    }
+
+    /// The values a line gives its names, written once and not split; the
+    /// names a builtin sets from what the text does not show have none.
+    ///
+    /// FAILS ON REVERT: let an option of `export` (`-n`, `+x`, a value of
+    /// its own) keep the plain reading, read a value with a blank or a
+    /// pattern as one word, let one given twice or added to keep its first
+    /// value, take any arm of `for`, `select` or `read` out, read the name
+    /// or the list of `for` from the wrong word, or read a `for` list of
+    /// values naming other programs as one, and a name here has a value it
+    /// should not, or none.
+    #[test]
+    fn the_values_a_line_gives_its_names() {
+        assert_eq!(value("export X=a", "X").as_deref(), Some("a"));
+        assert_eq!(value("X=a", "X").as_deref(), Some("a"));
+        for (text, name) in [
+            ("export -n X=a", "X"),
+            ("declare +x X=a", "X"),
+            ("export $O X=a", "X"),
+            ("X=a; X=b", "X"),
+            ("X+=a", "X"),
+            ("X=\"a b\"", "X"),
+            ("X=a*", "X"),
+            ("for N in /a/iw /b/x; do :; done", "N"),
+            ("for N in \"$V\"; do :; done", "N"),
+            ("for N in /a/i*; do :; done", "N"),
+            ("for N in ~/a/i* ~/b/i*; do :; done", "N"),
+            ("for N; do :; done", "N"),
+            ("for N in 'a b'; do :; done", "N"),
+            ("select N in a; do :; done", "N"),
+            ("read X", "X"),
+            ("printf -v X y", "X"),
+        ] {
+            assert!(given(text).contains_key(name), "{text}: {name} not seen");
+            assert_eq!(value(text, name), None, "{text}");
+        }
+        assert_eq!(
+            value("for N in /a/iw /b/iw; do :; done", "N").as_deref(),
+            Some("/a/iw")
+        );
+        assert_eq!(
+            value("for N in ~/a/iw ~/b/iw; do :; done", "N").as_deref(),
+            Some("~/a/iw")
+        );
+        // The builtin's own name is no name it sets.
+        assert_eq!(value("read=a; read X", "read").as_deref(), Some("a"));
+        assert_eq!(
+            value("for=a; for N in x; do :; done", "for").as_deref(),
+            Some("a")
+        );
+    }
+
+    fn places(text: &str) -> (bool, bool) {
+        let lexed = Lexer::read(text.as_bytes());
+        let functions = lexed.functions.iter().cloned().collect();
+        name_places(&lexed.commands, &functions)
+    }
+
+    /// Where the guard's name stands: where a value or a program comes from
+    /// (`source`), or only an argument (`aside`).
+    ///
+    /// FAILS ON REVERT: lose or flip what a substitution prints
+    /// (`source &= ...`, `^=`), read the input of a command only when it has
+    /// a here-document and a here-string at once, count the command word
+    /// among its own arguments (`head.at * 1`), or lose what a builtin that
+    /// gives values names (`&=`, `named && input`), and one of these places
+    /// is wrong.
+    #[test]
+    fn where_the_guards_name_stands() {
+        assert_eq!(places("ls $(echo innerwarden)"), (true, false));
+        assert_eq!(places("ls $(echo innerwarden) $(echo iw)"), (true, false));
+        assert_eq!(places("cat <<< innerwarden"), (false, true));
+        assert_eq!(places("cat <<E\ninnerwarden\nE"), (false, true));
+        assert_eq!(places("read X <<< innerwarden"), (true, false));
+        assert_eq!(places("X=innerwarden ls"), (true, false));
+        assert_eq!(places("innerwarden status"), (true, false));
+        assert_eq!(places("export X=innerwarden"), (true, false));
+        assert_eq!(places("printf -v X innerwarden"), (true, false));
+        assert_eq!(places("printf innerwarden"), (false, true));
+        assert_eq!(places("ls innerwarden"), (false, true));
+        assert_eq!(places("ls x"), (false, false));
+        assert_eq!(places("X=innerwarden innerwarden status"), (true, false));
+        assert_eq!(
+            places("export X=innerwarden; export Y=innerwarden"),
+            (true, false)
+        );
+    }
+
+    /// The name of a `${NAME}` the lexer records: letters, digits and `_`,
+    /// not starting with a digit, the braces holding nothing else.
+    ///
+    /// FAILS ON REVERT: take `_` only with a letter (`&&`), end the name at
+    /// the wrong byte, or turn any part of the guard on `${NAME}` and a name
+    /// here is recorded wrong or not at all.
+    #[test]
+    fn the_name_of_a_braced_expansion() {
+        let names = |text: &str| -> Vec<String> {
+            let lexed = Lexer::read(text.as_bytes());
+            lexed.commands[0]
+                .words
+                .iter()
+                .flat_map(|word| word.names.iter().map(|(_, name)| name.clone()))
+                .collect()
+        };
+        assert_eq!(names("echo ${A_B}x"), ["A_B"]);
+        assert_eq!(names("echo ${ABC}"), ["ABC"]);
+        assert_eq!(names("echo xx ${A1}"), ["A1"]);
+        assert_eq!(names("x ${AB}"), ["AB"]);
+        assert!(names("echo ${1}").is_empty());
+        assert!(names("echo ${1A}").is_empty());
+        assert!(names("echo ${A-x}").is_empty());
+        assert!(names("echo ${}").is_empty());
+    }
+
+    /// A name refused where it is a source in a text read inside another
+    /// text that is a source too, held where it is only an argument, and a
+    /// mention among the arguments of a program whose arguments are data.
+    ///
+    /// FAILS ON REVERT: join the places of the inner text to the outer
+    /// with `^=` and the first line is only held; take a program whose
+    /// arguments are data for one that may run them (`cmd.dynamic() &&`) and
+    /// the second is held; hold an argument the line hands on only where a
+    /// launcher and a verb both stand (`head.launched && self.verb`) and the
+    /// third is let through.
+    #[test]
+    fn a_source_inside_a_source_is_refused_and_a_mention_passes() {
+        let nested = "export X=innerwarden; sh -c 'export Y=innerwarden; $X \"$Y\"'";
+        let found = judge(nested.as_bytes(), false);
+        assert!(
+            found
+                .as_deref()
+                .is_some_and(|why| !why.starts_with("held:")),
+            "{nested}: {found:?}"
+        );
+        assert_eq!(judge(b"cp innerwarden \"$X\"", false), None);
+        assert_eq!(judge(b"sudo tar -cf x innerwarden \"$Y\"", false), None);
+        let handed = "./run x innerwarden \"$Y\"; echo monitor";
+        assert_eq!(
+            judge(handed.as_bytes(), false).as_deref(),
+            Some("held:argument-dynamic"),
+            "{handed}"
+        );
+    }
+
+    /// What a program does with its arguments is read from the words the
+    /// text shows: `cargo run` and `find -exec` run what they are handed.
+    ///
+    /// FAILS ON REVERT: read it from the words the text does not show
+    /// (`a.dynamic()`) and both are taken for programs whose arguments are
+    /// data, so the guard handed to them is let through.
+    #[test]
+    fn the_program_is_read_from_the_words_the_text_shows() {
+        for line in [
+            "sudo cargo run -p innerwarden \"$Y\"",
+            "sudo find . -exec innerwarden \"$Y\" ;",
+        ] {
+            assert_eq!(
+                judge(line.as_bytes(), false).as_deref(),
+                Some("held:argument-dynamic"),
+                "{line}"
+            );
+        }
+    }
+
+    /// A shell fed the text a command prints reads it as a line: the
+    /// guard's name in it beside a word the text does not show is refused.
+    /// A construct beside the guard's letters alone (here in a comment) is
+    /// held.
+    ///
+    /// FAILS ON REVERT: read the fed text only where the line holds no guard
+    /// word (`self.raw_only`) and the first is let through; hold only where
+    /// `raw` and `letters` stand at once and the second is.
+    #[test]
+    fn a_fed_line_is_read_and_the_guards_letters_alone_hold() {
+        assert_eq!(
+            judge(b"echo \"innerwarden $X\" | sh", false).as_deref(),
+            Some("guard-dynamic-arguments")
+        );
+        assert_eq!(
+            judge(b"$X \"$Y\" # iw_x allow", false).as_deref(),
+            Some("held:dynamic-command")
+        );
+    }
+
+    /// A value the line gives is read in place of the command word only
+    /// where the name starts it; a code string a shell runs with a value
+    /// the text does not show is refused beside the guard's name.
+    ///
+    /// FAILS ON REVERT: read a value that does not start the word
+    /// (`*at != 0 && word.glob`), or one followed by more than a path
+    /// (`&& !(rest.is_empty() || ...)`), and the first or the second is let
+    /// through; refuse the
+    /// code only where no guard word stands (`nameless`) and the second is.
+    #[test]
+    fn a_value_starts_the_word_it_stands_for_and_dynamic_code_is_refused() {
+        assert_eq!(
+            judge(b"B=/x/release/innerwarden; x$B --version", false).as_deref(),
+            Some("dynamic-command")
+        );
+        assert_eq!(
+            judge(b"B=/x/release/innerwarden; ${B}x --version", false).as_deref(),
+            Some("dynamic-command")
+        );
+        assert_eq!(
+            judge(b"B=/x/release/innerwarden; $B --version", false),
+            None
+        );
+        assert_eq!(
+            judge(b"sh -c \"echo $X\"; innerwarden status", false).as_deref(),
+            Some("dynamic-code")
+        );
+    }
+}

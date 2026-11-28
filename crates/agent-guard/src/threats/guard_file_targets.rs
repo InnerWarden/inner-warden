@@ -598,7 +598,8 @@ pub(super) fn found_guard_program_changed(content: &str) -> bool {
 /// [`operand_names_guard_program`] of the value after the first `skip`
 /// characters of `word` (`of=$(which innerwarden)`).
 fn operand_value_names_guard(word: &Word, skip: usize) -> bool {
-    if word.text.chars().count() <= skip || word.marks.len() <= skip {
+    // A mark a character: past the marks there is no value.
+    if word.marks.len() <= skip {
         return false;
     }
     let value = Word {
@@ -1187,5 +1188,41 @@ mod tests {
             Some(Some("/tmp/x y".to_owned()))
         );
         assert_eq!(read_value("-p HOME A", "/tmp/x"), None);
+    }
+
+    /// The rule on the operand, read alone: the program each command
+    /// changes is found where it stands, `dd` by its `of=`, a plain path is
+    /// left to the readings that resolve it, and a reader changes nothing.
+    ///
+    /// FAILS ON REVERT: take `dd` out of `found_guard_program_changed`, or
+    /// answer `operand_value_names_guard` with `false`, and the `dd` line is
+    /// not found; read a plain word as one the text does not show
+    /// (`operand_names_guard_program` without its `is_plain` answer) and the
+    /// plain build path is.
+    #[test]
+    fn the_guards_program_in_an_operand_not_shown_whole_is_read_alone() {
+        for line in [
+            "dd if=/dev/zero of=\"$(which innerwarden)\"",
+            "dd of=$(hash -t innerwarden) if=/dev/zero",
+            "mv \"${commands[innerwarden]}\" /tmp/x",
+            "cp /bin/true \"$D/iw\"",
+            "echo x | tee -a \"$(command -v iw-guard)\"",
+            ": > \"$(npm prefix -g)/bin/innerwarden-ctl\"",
+            "mv \"$(command -v innerwarden || command -v iw)\" /tmp/x",
+            "rm -f \"$(which iw)$innerwarden\"",
+        ] {
+            assert!(found_guard_program_changed(line), "{line}");
+        }
+        for line in [
+            "mv ./build/innerwarden \"$OUT\"",
+            "dd if=\"$(which innerwarden)\" of=/tmp/copy",
+            "dd of=",
+            "cp \"$(which innerwarden)\" /tmp/copy",
+            "sha256sum \"$(which innerwarden)\"",
+            "mv \"$W/innerwarden/wt-1\" /tmp/old",
+            "mv /usr/local/bin/innerwarden /tmp/x",
+        ] {
+            assert!(!found_guard_program_changed(line), "{line}");
+        }
     }
 }
