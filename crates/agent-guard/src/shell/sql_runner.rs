@@ -214,6 +214,44 @@ pub(crate) fn ssh_remote_lines(line: &str) -> Vec<String> {
         .collect()
 }
 
+/// `line` with the words of each `ssh` command that hands another host a
+/// line ([`ssh_remote_words`]) blanked, where that line is one of `judged`:
+/// the lines the analysis reads as lines of their own. The guard's own
+/// checks read a remote line there, as the line it is (a search pattern, a
+/// message, a value in it is data), and not here again as text. `None`
+/// where nothing is blanked, or the line does not parse whole.
+pub(crate) fn ssh_remote_words_blanked(line: &str, judged: &[String]) -> Option<String> {
+    if judged.is_empty() || !line.contains("ssh") {
+        return None;
+    }
+    let tree = parse_bash(line)?;
+    if tree.root_node().has_error() {
+        return None;
+    }
+    let mut commands = Vec::new();
+    collect_nodes_of_kind(tree.root_node(), "command", &mut commands, 0);
+    let mut out = line.as_bytes().to_vec();
+    let mut changed = false;
+    for command in commands {
+        let Some((remote, range)) = ssh_remote_words(command, line.as_bytes()) else {
+            continue;
+        };
+        if !judged.contains(&remote) {
+            continue;
+        }
+        for byte in out.get_mut(range).into_iter().flatten() {
+            if *byte != b'\n' {
+                *byte = b' ';
+            }
+        }
+        changed = true;
+    }
+    if !changed {
+        return None;
+    }
+    String::from_utf8(out).ok()
+}
+
 /// [`ssh_remote_line`], [`ssh_remote_words`]: the line, the map of its
 /// bytes and the range of its words.
 fn remote_line_of(
@@ -481,5 +519,25 @@ mod tests {
         );
         assert_eq!(line_sql_client("echo psql"), None);
         assert_eq!(line_sql_client("psql $X"), None);
+    }
+
+    #[test]
+    fn the_remote_words_are_blanked_where_their_line_is_judged() {
+        let judged = vec!["grep x f".to_owned()];
+        let blanked = ssh_remote_words_blanked("ssh h1 'grep x f'; ls", &judged).expect("blanked");
+        assert!(!blanked.contains("grep"), "{blanked}");
+        assert!(blanked.starts_with("ssh h1 "), "{blanked}");
+        assert!(blanked.ends_with("; ls"), "{blanked}");
+        assert_eq!(blanked.len(), "ssh h1 'grep x f'; ls".len());
+        assert_eq!(ssh_remote_words_blanked("ssh h1 'grep y f'", &judged), None);
+        assert_eq!(ssh_remote_words_blanked("ssh h1 'grep x f'", &[]), None);
+        assert_eq!(ssh_remote_words_blanked("grep x f", &judged), None);
+        assert_eq!(
+            ssh_remote_words_blanked("ssh h1 'grep x f' (", &judged),
+            None
+        );
+        let judged = vec!["a\nb".to_owned()];
+        let blanked = ssh_remote_words_blanked("ssh h1 'a\nb'", &judged).expect("blanked");
+        assert!(blanked.contains('\n'), "{blanked:?}");
     }
 }

