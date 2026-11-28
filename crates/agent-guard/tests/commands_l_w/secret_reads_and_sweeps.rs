@@ -294,24 +294,24 @@ fn a_hunt_of_the_home_in_every_search_form_is_refused() {
     }
 }
 
-/// A substitution worked out to `~/.ssh/config` is judged as the file
-/// named outright: the client configuration is not one of the public SSH
-/// files (`known_hosts`, `authorized_keys`, a `.pub`), so both are refused
-/// alike, and `known_hosts` passes both ways.
+/// A substitution worked out to a public SSH file (`known_hosts`) is
+/// judged as the file named outright. The client's settings named outright
+/// (`~/.ssh/config`) are read freely since 2026-11-27
+/// (`shell::ssh_client`); a path to them worked out from a variable that
+/// holds a key's name is still read as a path under `~/.ssh`: the settings
+/// are told apart where they are named, before any substitution is worked
+/// out, and a worked-out path stays on the side of the key.
 #[test]
 fn a_worked_out_path_has_the_verdict_of_the_path_named_outright() {
-    for (built, named) in [
-        (
-            "f=~/.ssh/id_ed25519.pub; cat \"$(dirname \"$f\")/config\"",
-            "cat ~/.ssh/config",
-        ),
-        (
-            "f=~/.ssh/id_ed25519.pub; cat \"$(dirname \"$f\")/known_hosts\"",
-            "cat ~/.ssh/known_hosts",
-        ),
-    ] {
-        assert_eq!(verdict(built), verdict(named), "{built} / {named}");
-    }
+    assert_eq!(
+        verdict("f=~/.ssh/id_ed25519.pub; cat \"$(dirname \"$f\")/known_hosts\""),
+        verdict("cat ~/.ssh/known_hosts")
+    );
+    assert_eq!(verdict("cat ~/.ssh/config"), "allow");
+    assert_eq!(
+        verdict("f=~/.ssh/id_ed25519.pub; cat \"$(dirname \"$f\")/config\""),
+        "deny"
+    );
 }
 
 /// The key read holds wherever the substitution stands on the line: one
