@@ -85,11 +85,35 @@ This appends a `Signed-off-by` line using your `git` name and email. The DCO tex
 is at https://developercertificate.org. If you forget the sign-off on an existing
 commit, amend it with `git commit -s --amend`.
 
+## Mutation testing (the screening engine)
+
+A change under `crates/agent-guard/src` decides what an agent may run, so its
+tests must catch a weakened version of it. Before you open a pull request that
+changes that code, run:
+
+```sh
+scripts/mutants-pre-pr.sh            # against origin/main; or: scripts/mutants-pre-pr.sh <base>
+```
+
+It mutates every line your branch changes (cargo-mutants, the same settings as
+the nightly run) and exits non-zero, listing them, when a mutant survives or
+times out. Kill each with a test, or, when a mutant changes nothing a caller
+can see, list it in `.cargo/mutants.toml` `exclude_re` with the reason. Open
+the pull request only with this green, and say so in it. The run wants many
+cores: set `MUTANTS_HOST` to an ssh destination to run it on a bigger machine
+(the script copies your working tree there), and `MUTANTS_JOBS` to choose how
+many mutants are tested at once.
+
+Pull requests are not mutation-tested by CI (the repository is public, and the
+runner that does this work runs only the scheduled jobs of `nightly-deep.yml`).
+That nightly run tests every change of the day again and fails on any survivor.
+
 ## Submitting a pull request
 
 1. Fork the repository and create a branch.
 2. Make your change, with tests, and sign off each commit (`git commit -s`).
-3. Run the build, test, fmt, and clippy commands above until they pass.
+3. Run the build, test, fmt, and clippy commands above until they pass, and,
+   for a change to `crates/agent-guard/src`, `scripts/mutants-pre-pr.sh`.
 4. Open a pull request describing the change and its motivation.
 
 Everyone taking part follows the [Code of Conduct](CODE_OF_CONDUCT.md).

@@ -79,33 +79,96 @@ jobs:
   # A day of heavy work on this crate measured 56 mutants, about an hour. That
   # is the size the nightly is built for.
 
-  # WHY THE NIGHTLY IS SHARDED (2026-11-27)
+  # WHY THE NIGHTLY WAS SHARDED (2026-11-27)
   #
   # From 2026-11-19 the job above failed every night with "The 75m budget was
   # not enough" and no surviving mutant: the diffs of a day had 236 to 3,120
   # mutants, and the unmutated test run had grown from 86 s (2026-11-09) to
-  # 355 s, so 75 minutes at -j 2 tested a dozen or two. Two changes:
+  # 355 s, so 75 minutes at -j 2 tested a dozen or two. .cargo/mutants.toml now
+  # builds the dependencies optimised for every cargo-mutants run (it says what
+  # that measured), and the day's mutants were split into up to twenty shards.
+  # A heavy day still held more than twenty shards could test, so the run said
+  # "tested X of Y" and the rest went untested.
+
+  # WHY THE DIFF JOB RUNS ON ITS OWN RUNNER (2026-11-28)
   #
-  #   - .cargo/mutants.toml builds the dependencies optimised for every
-  #     cargo-mutants run; it says what that measured.
-  #   - the plan job counts the day's mutants and splits them into up to
-  #     twenty shards of about forty each, the number one runner tested in
-  #     well under the budget when measured (25 mutants of the 2026-11-24 diff
-  #     in 29.5 minutes, baseline included, on 4 cores at -j 2).
+  # On GitHub's runners (4 cores, -j 2) a mutant took about six minutes, 228 s
+  # to build and 120 s to test. The diff job now runs on a self-hosted runner
+  # (label iw-mutants, 32 cores) in one job with no budget that cuts it short:
+  # every mutant of the day's diff is tested and a survivor or a hang fails
+  # the job. Measured on 33 mutants of one change (2026-11-28), with the same
+  # verdicts in every run but the overloaded one:
   #
-  # A heavy day can still hold more mutants than twenty shards can test. Then each shard
-  # tests what fits, and the run says "tested X of Y" as a warning: never green
-  # in silence, and never red because of the budget. A survivor or a hang among
-  # what was tested is red, as before.
+  #   as CI runs it, -j 8                     634 s   build 76 s, test 50 s a mutant
+  #   + mold and sccache (scripts/mutants-env.sh)   582 s   build 71 s, test 46 s
+  #   + cargo-nextest                         596 s   one verdict differs: not used
+  #   engine at opt-level 1                   600 s   build 59 s, test 57 s: no gain
+  #   -j 16                                   723 s   a timeout and a verdict differ
+  #
+  # About 15 s of runner time a mutant: 3,120 mutants, the heaviest day seen,
+  # is thirteen hours; the timeout below is above that.
+  #
+  # The Sunday sweep (below) stays on GitHub's runners: there it is forty free
+  # jobs that finish inside their budget, and on this runner it would be one
+  # job of about 22 hours.
+  #
+  # The runner's machine is off between runs. A scheduled job outside this
+  # repository starts it at 02:50 UTC, 27 minutes before the 03:17 cron, and
+  # the machine powers itself off once it has been idle for 10 minutes after
+  # the job (it waits 45 minutes after boot for a late cron), then is
+  # deallocated within 15 minutes. If it is not up, this job waits in the
+  # queue for it (GitHub keeps a self-hosted job queued for 24 hours).
+  #
+  # The repository is public, and a self-hosted runner runs what a workflow
+  # tells it to. So this runner takes this job only: the workflow starts on a
+  # schedule or by hand (workflow_dispatch needs write access), never on a pull
+  # request, and the job checks the event as well. A pull request is
+  # mutation-tested before it opens, by scripts/mutants-pre-pr.sh
+  # (CONTRIBUTING.md), the same script this job runs.
 
   mutants-diff:
     name: cargo-mutants on the day's changes
-    # Not on the Sunday cron: that slot runs the full sweep below. The plan,
-    # the shards and their verdict are in mutants-diff.yml.
-    if: github.event.schedule != '17 5 * * 0'
-    uses: ./.github/workflows/mutants-diff.yml
-    with:
-      diff_base: ${{ inputs.diff_base }}
+    # Not on the Sunday cron: that slot runs the full sweep below.
+    if: >-
+      github.event.schedule != '17 5 * * 0'
+      && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
+    runs-on: [self-hosted, iw-mutants]
+    timeout-minutes: 1080
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # `--in-diff` needs history to diff against; the default shallow
+          # checkout has none and the diff would silently come out empty, which
+          # is the failure mode where a check reports success having done nothing.
+          fetch-depth: 0
+      - name: Mutate what changed
+        # scripts/mutants-pre-pr.sh, as before a pull request: every mutant of
+        # the diff against the newest commit older than 26 hours (or
+        # diff_base), with the memory cap and the environment of
+        # scripts/mutants-env.sh. It exits 1 on a survivor or a timeout and 2
+        # when nothing could be judged (the unmutated tests fail, the diff does
+        # not apply, the cap was not on); both fail the job.
+        env:
+          DIFF_BASE: ${{ inputs.diff_base }}
+          MUTANTS_OUT: ${{ runner.temp }}/mutants-diff
+        run: |
+          set -euo pipefail
+          if [ -n "${DIFF_BASE:-}" ]; then
+            base=$(git rev-parse --verify "${DIFF_BASE}^{commit}")
+          else
+            base=$(git rev-list -1 --before="26 hours ago" HEAD || true)
+          fi
+          if [ -z "$base" ]; then
+            echo "No commit older than 26 hours; nothing to diff against."
+            exit 0
+          fi
+          bash scripts/mutants-pre-pr.sh "$base"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: mutants-report-diff
+          path: ${{ runner.temp }}/mutants-diff/mutants.out/
+          if-no-files-found: ignore
 
   mutants-full:
     name: cargo-mutants full sweep (shard ${{ matrix.shard }}/40)

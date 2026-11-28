@@ -31,10 +31,24 @@
 # MUTANTS_TEST_MEMORY_KIB  the cap in KiB. Default 4 GiB.
 # MUTANTS_TEST_RUNNER_LOG  when set, one line is appended per run, so the
 #                          workflow can prove the cap was applied at all.
+#
+# TEST THREADS. The cap is on address space, and every test thread reserves
+# its own: a stack and, on glibc, a malloc arena of up to 64 MiB. A test
+# binary starts one thread per processor, so the same unmutated suite that
+# passes under the cap on a 4-core runner aborts under it on a 32-core box
+# (measured 2026-11-28: "memory allocation of 320000 bytes failed" in the
+# library tests, which pass in 8 s with 8 threads). At most eight test threads
+# per binary keeps what the cap measures the same on every machine; the
+# mutants run side by side (-j), so the box stays busy. RUST_TEST_THREADS, when
+# the caller sets it, wins.
 set -euo pipefail
 
 cap=${MUTANTS_TEST_MEMORY_KIB:-4194304}
 ulimit -v "$cap"
+if [ -z "${RUST_TEST_THREADS:-}" ]; then
+  cpus=$(nproc 2>/dev/null || echo 8)
+  export RUST_TEST_THREADS=$(( cpus < 8 ? cpus : 8 ))
+fi
 if [ -n "${MUTANTS_TEST_RUNNER_LOG:-}" ]; then
   echo "$(ulimit -v) KiB ${1##*/}" >> "$MUTANTS_TEST_RUNNER_LOG"
 fi
