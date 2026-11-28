@@ -17,18 +17,33 @@
 
 mod lexer;
 mod rules;
+pub(super) use rules::Doubt;
 mod tokens;
 
 /// Whether `content` holds a guard name or verb beside a construct that is
 /// not read.
+#[cfg(test)]
 pub(super) fn unread_beside_guard_word(content: &str) -> bool {
-    rules::judge(content.as_bytes(), true).is_some()
+    doubt_beside_guard_word(content) == Some(Doubt::Refused)
+}
+
+/// What a guard word beside a construct no reading follows earns: refused
+/// where the name may reach the program that construct runs, held for
+/// review where it is only an argument or a mention ([`Doubt`]).
+pub(super) fn doubt_beside_guard_word(content: &str) -> Option<Doubt> {
+    rules::judge(content.as_bytes(), true).map(|reason| {
+        if reason.starts_with("held:") {
+            Doubt::Held
+        } else {
+            Doubt::Refused
+        }
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::super::{check_guard_self_disable, guard_verb_loosens, GUARD_VERB_HEADS};
-    use super::unread_beside_guard_word;
+    use super::{doubt_beside_guard_word, unread_beside_guard_word, Doubt};
 
     /// Whether the engine, which hands the check the line's executable
     /// projection and not the line, refuses `line` as a lowering of the
@@ -281,10 +296,15 @@ mod tests {
             assert!(!unread_beside_guard_word(line), "{line}");
             assert!(!engine_refuses(line), "{line}");
         }
+        // A folder of one's own that holds the guard's letters is a mention
+        // (the argument of `cd`): the command word no reading follows
+        // beside it is held for review, not refused.
         let line =
             r#"cd ~/src/innerwarden/ && $EDITOR notes.md && git commit -m "allow empty names""#;
-        assert!(unread_beside_guard_word(line), "{line}");
-        assert!(engine_refuses(line), "{line}");
+        assert!(!unread_beside_guard_word(line), "{line}");
+        assert_eq!(doubt_beside_guard_word(line), Some(Doubt::Held), "{line}");
+        let analysis = crate::mcp::analyze_command(line, None);
+        assert_eq!(analysis.recommendation, "review", "{line}");
     }
 
     /// A word after the command word that is not spelled out may be empty

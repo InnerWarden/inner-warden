@@ -46,16 +46,22 @@ fn a_home_set_under_a_name_in_pieces_is_not_the_home() {
 }
 
 /// A worktree beside the project, under `.worktrees` or through a `$HOME`
-/// the line leaves alone stays a work folder: held for review, as before.
+/// the line leaves alone stays a work folder. One named from the folder
+/// the line runs in is held for review, as before; one in the middle of a
+/// path to a folder of one's own is no target of a removal of the guard
+/// (since 2026-11-27) and passes.
 #[test]
 fn worktrees_that_stay_in_the_work_folder_are_held_for_review() {
+    assert_eq!(
+        verdict("git worktree remove --force ../innerwarden-wt"),
+        "review"
+    );
     for line in [
-        "git worktree remove --force ../innerwarden-wt",
         "git worktree remove --force ~/github/_innerwarden/.worktrees/t1",
         "git worktree remove --force $HOME/innerwarden/wt-review",
         "git worktree remove --force \"$HOME/innerwarden/wt-review\"",
         "echo \"$HOME\" && git worktree remove --force $HOME/innerwarden/wt-review",
     ] {
-        assert_eq!(verdict(line), "review", "{line}");
+        assert_eq!(verdict(line), "allow", "{line}");
     }
 }

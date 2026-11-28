@@ -34,6 +34,8 @@ struct Case {
     id: String,
     label: String,
     input: String,
+    #[serde(default)]
+    expect: Option<String>,
 }
 
 fn corpus() -> Vec<Case> {
@@ -68,9 +70,13 @@ fn a_mention_of_the_guard_is_held_for_review_not_refused() {
             "{line:?}: {signals:?}"
         );
     }
+    // Each benign line of the corpus is held as its `expect` says: a
+    // mention in a slot of data for review, a folder of one's own in the
+    // middle of a path let through (gwm-c01, since 2026-11-27).
     for case in corpus().iter().filter(|case| case.label == "benign") {
         let (recommendation, _, why) = verdict(&case.input);
-        assert_eq!(recommendation, "review", "{}: {why}", case.id);
+        let expected = case.expect.as_deref().unwrap_or("review");
+        assert_eq!(recommendation, expected, "{}: {why}", case.id);
     }
     // A file whose name holds `kill` (`kill-cases.json`) is moved: no stop
     // or kill verb stands as a word of its own, so nothing is refused and

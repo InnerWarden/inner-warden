@@ -1,6 +1,7 @@
 //! The fail-closed rule: deny when the line holds a guard CLI name or a
 //! guard-lowering verb AND a command the reading cannot vouch for.
 
+use super::super::program_places::{arguments_of, Arguments};
 use super::super::{
     ctl_verb_loosens, guard_verb_loosens, skip_leading_options, GUARD_PROGRAMS as NAMES,
     GUARD_VERB_HEADS, SHELLS,
@@ -963,6 +964,222 @@ struct Judge {
     /// The guard's letters stand in the text, inside a longer word as well:
     /// the shell can cut that word down to the name.
     letters: bool,
+    /// The values the text being read gives its variables, each written
+    /// once: by name, the command that gives it and the value. `None` for a
+    /// name given more than one value, or one the text does not show
+    /// ([`values_given`]).
+    values: std::collections::HashMap<String, Option<(usize, Word)>>,
+    /// The command being read, by its place among the commands of the text.
+    at_command: usize,
+    /// The line names `IFS`: no value is read into a command word.
+    ifs: bool,
+    /// The guard's name or letters stand where a value or a program the
+    /// text runs comes from ([`name_places`]), in the text being read or
+    /// one around it: a construct no reading follows may then be the guard.
+    source: bool,
+    /// They stand only where a program the line does not know is handed
+    /// them, or as a mention.
+    aside: bool,
+    /// The first construct no reading follows beside a guard name that is
+    /// only an argument or a mention: held for review, not refused.
+    held: Option<&'static str>,
+}
+
+/// What a guard word beside a construct no reading follows earns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::threats) enum Doubt {
+    /// The name may reach the program that construct runs: refused.
+    Refused,
+    /// The name only stands as an argument of a program the line does not
+    /// know, or as a mention: held for review.
+    Held,
+}
+
+/// Whether `word` holds the guard's name or its letters.
+fn holds_guard_letters(word: &Word) -> bool {
+    guard_letters(word.lit.as_bytes())
+}
+
+/// The values the commands of a text give their variables, each written
+/// once ([`Judge::values`]): an assignment alone or after `export`,
+/// `declare`, `typeset`, `local` or `readonly`. A name `for`, `read`,
+/// `mapfile`, `readarray`, `getopts` or `printf -v` sets, one given a value
+/// more than once or added to (`+=`), and one whose value the shell splits
+/// into more words (a blank, a pattern), has none the text shows. In a line
+/// that names `IFS` none is read ([`Judge::ifs`]): any character may split
+/// a value.
+fn values_given(commands: &[Command]) -> std::collections::HashMap<String, Option<(usize, Word)>> {
+    let mut values: std::collections::HashMap<String, Option<(usize, Word)>> =
+        std::collections::HashMap::new();
+    for (at, command) in commands.iter().enumerate() {
+        let words = &command.words;
+        let head = command_index(words);
+        let program = words.get(head.at).map(|w| base_of(&w.lit));
+        let unread = |values: &mut std::collections::HashMap<_, _>, name: &str| {
+            values.insert(name.to_string(), None);
+        };
+        // `declare -n` and the like make a name refer to another: only a
+        // plain assignment gives a value.
+        let options = words[head.at.min(words.len())..]
+            .iter()
+            .skip(1)
+            .any(|w| w.lit.starts_with('-') || w.lit.starts_with('+') || w.dynamic());
+        match program.as_deref() {
+            Some("export" | "declare" | "typeset" | "local" | "readonly") if options => {
+                for word in words.iter().filter(|w| is_assignment(w)) {
+                    if let Some((name, _)) = word.lit.split_once('=') {
+                        unread(&mut values, name.trim_end_matches('+'));
+                    }
+                }
+            }
+            None | Some("export" | "declare" | "typeset" | "local" | "readonly") => {
+                for word in words {
+                    if !is_assignment(word) {
+                        continue;
+                    }
+                    let Some((name, value)) = word.lit.split_once('=') else {
+                        continue;
+                    };
+                    let appends = name.ends_with('+');
+                    let name = name.trim_end_matches('+');
+                    let mut given = Word::default();
+                    given.lit = value.to_string();
+                    given.expansion = value.contains(EXPANSION);
+                    given.glob = word.glob;
+                    let splits = word.glob || value.contains(char::is_whitespace);
+                    match values.get(name) {
+                        None if !appends && !splits => {
+                            values.insert(name.to_string(), Some((at, given)));
+                        }
+                        _ => unread(&mut values, name),
+                    }
+                }
+            }
+            // `for NAME in VALUE...`: every value written and naming the
+            // same program, the first stands for them all.
+            Some("for") => {
+                let Some(name) = words.get(head.at + 1) else {
+                    continue;
+                };
+                let list = words
+                    .get(head.at + 2)
+                    .filter(|w| w.lit == "in")
+                    .map(|_| &words[head.at + 3..]);
+                let same = list.filter(|list| {
+                    list.first().is_some_and(|first| {
+                        list.iter().all(|value| {
+                            // A `~` at its start is the home folder, a path.
+                            let pattern = value.lit.contains(['*', '?', '[', '{']);
+                            !value.expansion
+                                && !(value.glob && !(value.tilde && !pattern))
+                                && !value.lit.contains(char::is_whitespace)
+                                && base_of(&value.lit) == base_of(&first.lit)
+                        })
+                    })
+                });
+                match (values.get(&name.lit), same) {
+                    (None, Some(list)) => {
+                        let mut given = Word::default();
+                        given.lit = list[0].lit.clone();
+                        values.insert(name.lit.clone(), Some((at, given)));
+                    }
+                    _ => unread(&mut values, &name.lit),
+                }
+            }
+            Some("select") => {
+                if let Some(name) = words.get(head.at + 1) {
+                    unread(&mut values, &name.lit);
+                }
+            }
+            Some("read" | "mapfile" | "readarray" | "getopts" | "printf") => {
+                for word in &words[head.at + 1..] {
+                    unread(&mut values, &word.lit);
+                }
+            }
+            _ => {}
+        }
+    }
+    values
+}
+
+/// The builtins that give a variable a value from their words or their
+/// input, or run their words as code in the shell itself.
+const VALUE_GIVERS: &[&str] = &[
+    "export",
+    "declare",
+    "typeset",
+    "local",
+    "readonly",
+    "read",
+    "mapfile",
+    "readarray",
+    "getopts",
+    "set",
+    "for",
+    "select",
+    "alias",
+    "hash",
+    "let",
+    "eval",
+    "source",
+    ".",
+];
+
+/// Where the guard's name or letters stand among `commands` (the commands
+/// of one text): (`source`, `aside`).
+///
+/// `source`: where a value or a program of this shell comes from: the
+/// command word, a value an assignment gives, the words and input of a
+/// builtin that gives a variable its value or runs them in the shell
+/// ([`VALUE_GIVERS`], `printf -v`, a function the line defines), and what
+/// a substitution prints. A construct the reading does not follow may then
+/// run the guard, and is refused.
+///
+/// `aside`: an argument of any other program, which is a mention where the
+/// program's arguments are data, may be run by a program the line does not
+/// know, and is read again as its own text where a shell or `ssh` runs it.
+/// A construct beside it is held for review.
+fn name_places(
+    commands: &[Command],
+    functions: &std::collections::HashSet<String>,
+) -> (bool, bool) {
+    let (mut source, mut aside) = (false, false);
+    for command in commands {
+        let words = &command.words;
+        if command.substituted {
+            source |= words.iter().any(holds_guard_letters);
+            continue;
+        }
+        let input = command
+            .heredocs
+            .iter()
+            .any(|h| guard_letters(h.body.as_bytes()))
+            || command.herestrings.iter().any(holds_guard_letters);
+        let head = command_index(words);
+        for word in &words[..head.at.min(words.len())] {
+            if is_assignment(word) && holds_guard_letters(word) {
+                source = true;
+            }
+        }
+        let Some(cmd) = words.get(head.at) else {
+            aside |= input;
+            continue;
+        };
+        source |= holds_guard_letters(cmd);
+        let args = &words[head.at + 1..];
+        let base = base_of(&cmd.lit);
+        let gives = !cmd.dynamic()
+            && (VALUE_GIVERS.contains(&base.as_str())
+                || functions.contains(&cmd.lit)
+                || base == "printf" && args.iter().any(|a| a.lit.starts_with("-v")));
+        let named = args.iter().any(holds_guard_letters);
+        if gives {
+            source |= named || input;
+        } else {
+            aside |= named || input;
+        }
+    }
+    (source, aside)
 }
 
 type Deny = Option<String>;
@@ -987,11 +1204,70 @@ impl Judge {
         self.context(&lexed, depth + 1)
     }
 
+    /// [`Judge::context_in`] with the values and the places of the guard's
+    /// name read for this text: a text read inside it keeps the places of
+    /// the one around it (`export X=innerwarden; sh -c '$X "$Y"'`), not its
+    /// values (an inner shell has only what was exported).
     fn context(&mut self, lexed: &Lexed, depth: usize) -> Deny {
+        self.functions.extend(lexed.functions.iter().cloned());
+        let given = if self.ifs {
+            Default::default()
+        } else {
+            values_given(&lexed.commands)
+        };
+        let values = std::mem::replace(&mut self.values, given);
+        let (source, aside) = name_places(&lexed.commands, &self.functions);
+        let around = (self.source, self.aside, self.at_command);
+        self.source |= source;
+        self.aside |= aside;
+        let found = self.context_in(lexed, depth);
+        self.values = values;
+        (self.source, self.aside, self.at_command) = around;
+        found
+    }
+
+    /// The command word with a variable the text gives a written value in
+    /// its place (`B=~/tgt/x/release/innerwarden; $B --version`): `$NAME` or
+    /// `${NAME}` at its start, a value given once by a command before this
+    /// one, and nothing after it but the rest of a path.
+    fn resolved(&self, word: &Word) -> Option<Word> {
+        let (at, name) = word.names.first()?;
+        let rest = word.lit.get(at + EXPANSION.len_utf8()..)?;
+        if *at != 0
+            || word.glob
+            || rest.contains(EXPANSION)
+            || !(rest.is_empty() || rest.starts_with('/'))
+        {
+            return None;
+        }
+        let (given_at, value) = self.values.get(name)?.as_ref()?;
+        if *given_at >= self.at_command {
+            return None;
+        }
+        let mut word = Word::default();
+        word.lit = format!("{}{rest}", value.lit);
+        word.expansion = value.expansion;
+        word.glob = value.glob;
+        Some(word)
+    }
+
+    /// Holds a construct beside a guard name that is only an argument or a
+    /// mention for review; refuses it where the name is where a program or a
+    /// value comes from.
+    fn doubt(&mut self, reason: &'static str) -> Deny {
+        if self.source {
+            return deny(reason);
+        }
+        if self.aside || self.name || self.raw || self.letters {
+            self.held.get_or_insert(reason);
+        }
+        None
+    }
+
+    fn context_in(&mut self, lexed: &Lexed, depth: usize) -> Deny {
         if let Some(what) = lexed.doubt.first() {
             return Some(format!("doubt:{what}"));
         }
-        self.functions.extend(lexed.functions.iter().cloned());
         let commands = &lexed.commands;
         self.built |= commands.iter().any(|c| c.substituted && prints_verb(c));
         let created = created_files(commands);
@@ -1004,21 +1280,20 @@ impl Judge {
             // Text piped into an interpreter is its code.
             for pair in commands.windows(2) {
                 let fed = &pair[0];
-                if fed.pipe_next
-                    && is_interpreter(&pair[1].words)
-                    && code_runs_guard(
-                        fed.words
-                            .iter()
-                            .map(|w| w.lit.as_str())
-                            .chain(fed.heredocs.iter().map(|h| h.body.as_str()))
-                            .chain(fed.herestrings.iter().map(|w| w.lit.as_str())),
-                    )
-                {
+                let code = || {
+                    fed.words
+                        .iter()
+                        .map(|w| w.lit.as_str())
+                        .chain(fed.heredocs.iter().map(|h| h.body.as_str()))
+                        .chain(fed.herestrings.iter().map(|w| w.lit.as_str()))
+                };
+                if fed.pipe_next && is_interpreter(&pair[1].words) && code_runs_guard(code()) {
                     return deny("interpreter-code");
                 }
             }
         }
-        for command in commands {
+        for (at, command) in commands.iter().enumerate() {
+            self.at_command = at;
             if let Some(reason) = self.command(command, &command.words, feeds, depth) {
                 return Some(reason);
             }
@@ -1036,7 +1311,8 @@ impl Judge {
 
     fn command(&mut self, command: &Command, words: &[Word], feeds: bool, depth: usize) -> Deny {
         let head = command_index(words);
-        let cmd = words.get(head.at);
+        let resolved = words.get(head.at).and_then(|word| self.resolved(word));
+        let cmd = resolved.as_ref().or(words.get(head.at));
         let args: &[Word] = if head.at < words.len() {
             &words[head.at + 1..]
         } else {
@@ -1051,16 +1327,16 @@ impl Judge {
             }
             return None;
         }
-        if self.raw
-            && is_interpreter(words)
-            && code_runs_guard(
+        if self.raw && is_interpreter(words) {
+            let code = || {
                 args.iter()
                     .map(|a| a.lit.as_str())
                     .chain(command.heredocs.iter().map(|h| h.body.as_str()))
-                    .chain(command.herestrings.iter().map(|w| w.lit.as_str())),
-            )
-        {
-            return deny("interpreter-code");
+                    .chain(command.herestrings.iter().map(|w| w.lit.as_str()))
+            };
+            if code_runs_guard(code()) {
+                return deny("interpreter-code");
+            }
         }
         // The guard's name is nowhere on the line, only a word that is also
         // one of its verbs. An expansion that held the name could hold the
@@ -1132,14 +1408,31 @@ impl Judge {
                     {
                         return deny("dynamic-command");
                     }
-                    if base.contains(EXPANSION) && (!nameless || spells_lowering(args)) {
-                        return deny("dynamic-command");
+                    if base.contains(EXPANSION) {
+                        if self.built || spells_lowering(args) {
+                            return deny("dynamic-command");
+                        }
+                        if !nameless {
+                            if let Some(reason) = self.doubt("dynamic-command") {
+                                return Some(reason);
+                            }
+                        }
                     }
                     if cmd.expansion && self.name {
-                        return deny("dynamic-directory");
+                        if let Some(reason) = self.doubt("dynamic-directory") {
+                            return Some(reason);
+                        }
                     }
                 }
-                if guard_name(cmd).is_none() && !ONLY_DATA.contains(&base.as_str()) {
+                let shown: Vec<&str> = args
+                    .iter()
+                    .filter(|a| !a.dynamic())
+                    .map(|a| a.lit.as_str())
+                    .collect();
+                // A guard name among the arguments of a program whose
+                // arguments are data is a mention.
+                let data = !cmd.dynamic() && arguments_of(&base, &shown) == Arguments::Data;
+                if guard_name(cmd).is_none() && !ONLY_DATA.contains(&base.as_str()) && !data {
                     // dynamic_from[j]: a word of args[j..] is not spelled out.
                     let mut dynamic_from = vec![false; args.len() + 1];
                     for j in (0..args.len()).rev() {
@@ -1166,8 +1459,11 @@ impl Judge {
                                 if fed {
                                     return deny("argument-fed");
                                 }
+                                // An argument of a program the line does
+                                // not show to be data: that program may run
+                                // it with what follows. Held for review.
                                 if only_flags || head.launched || self.verb {
-                                    return deny("argument-dynamic");
+                                    self.held.get_or_insert("argument-dynamic");
                                 }
                             }
                         } else if arg_base.contains(EXPANSION)
@@ -1229,8 +1525,13 @@ impl Judge {
         }
         for (code, outer, strict) in code_strings(words, &head) {
             // An empty code stands for one that could not be read.
-            if outer && strict && (!nameless || code.is_empty()) {
+            if outer && strict && code.is_empty() {
                 return deny("dynamic-code");
+            }
+            if outer && strict && !nameless {
+                if let Some(reason) = self.doubt("dynamic-code") {
+                    return Some(reason);
+                }
             }
             if let Some(reason) = self.relex(&code, depth) {
                 return Some(reason);
@@ -1245,8 +1546,13 @@ impl Judge {
                 ])
             };
             for word in words {
-                if is_line(&word.lit) && !self.raw_only {
-                    if let Some(reason) = self.relex(&word.lit, depth) {
+                // A variable the text gives a written value is that value
+                // here too ([`Judge::resolved`]): no line hides in it.
+                let lit = self
+                    .resolved(word)
+                    .map_or_else(|| word.lit.clone(), |resolved| resolved.lit);
+                if is_line(&lit) && !self.raw_only {
+                    if let Some(reason) = self.relex(&lit, depth) {
                         return Some(reason);
                     }
                 }
@@ -1373,6 +1679,242 @@ pub(super) fn judge(text: &[u8], flat: bool) -> Option<String> {
         raw_only,
         built: false,
         letters: guard_letters(text),
+        values: Default::default(),
+        at_command: 0,
+        ifs: text.windows(3).any(|w| w == b"IFS"),
+        source: false,
+        aside: false,
+        held: None,
     };
-    judge.context(&lexed, 0)
+    judge
+        .context(&lexed, 0)
+        .or_else(|| judge.held.map(|reason| format!("held:{reason}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn given(text: &str) -> std::collections::HashMap<String, Option<String>> {
+        values_given(&Lexer::read(text.as_bytes()).commands)
+            .into_iter()
+            .map(|(name, value)| (name, value.map(|(_, word)| word.lit)))
+            .collect()
+    }
+
+    fn value(text: &str, name: &str) -> Option<String> {
+        given(text).get(name).cloned().flatten()
+    }
+
+    /// The values a line gives its names, written once and not split; the
+    /// names a builtin sets from what the text does not show have none.
+    ///
+    /// FAILS ON REVERT: let an option of `export` (`-n`, `+x`, a value of
+    /// its own) keep the plain reading, read a value with a blank or a
+    /// pattern as one word, let one given twice or added to keep its first
+    /// value, take any arm of `for`, `select` or `read` out, read the name
+    /// or the list of `for` from the wrong word, or read a `for` list of
+    /// values naming other programs as one, and a name here has a value it
+    /// should not, or none.
+    #[test]
+    fn the_values_a_line_gives_its_names() {
+        assert_eq!(value("export X=a", "X").as_deref(), Some("a"));
+        assert_eq!(value("X=a", "X").as_deref(), Some("a"));
+        for (text, name) in [
+            ("export -n X=a", "X"),
+            ("declare +x X=a", "X"),
+            ("export $O X=a", "X"),
+            ("X=a; X=b", "X"),
+            ("X+=a", "X"),
+            ("X=\"a b\"", "X"),
+            ("X=a*", "X"),
+            ("for N in /a/iw /b/x; do :; done", "N"),
+            ("for N in \"$V\"; do :; done", "N"),
+            ("for N in /a/i*; do :; done", "N"),
+            ("for N in ~/a/i* ~/b/i*; do :; done", "N"),
+            ("for N; do :; done", "N"),
+            ("for N in 'a b'; do :; done", "N"),
+            ("select N in a; do :; done", "N"),
+            ("read X", "X"),
+            ("printf -v X y", "X"),
+        ] {
+            assert!(given(text).contains_key(name), "{text}: {name} not seen");
+            assert_eq!(value(text, name), None, "{text}");
+        }
+        assert_eq!(
+            value("for N in /a/iw /b/iw; do :; done", "N").as_deref(),
+            Some("/a/iw")
+        );
+        assert_eq!(
+            value("for N in ~/a/iw ~/b/iw; do :; done", "N").as_deref(),
+            Some("~/a/iw")
+        );
+        // The builtin's own name is no name it sets.
+        assert_eq!(value("read=a; read X", "read").as_deref(), Some("a"));
+        assert_eq!(
+            value("for=a; for N in x; do :; done", "for").as_deref(),
+            Some("a")
+        );
+    }
+
+    fn places(text: &str) -> (bool, bool) {
+        let lexed = Lexer::read(text.as_bytes());
+        let functions = lexed.functions.iter().cloned().collect();
+        name_places(&lexed.commands, &functions)
+    }
+
+    /// Where the guard's name stands: where a value or a program comes from
+    /// (`source`), or only an argument (`aside`).
+    ///
+    /// FAILS ON REVERT: lose or flip what a substitution prints
+    /// (`source &= ...`, `^=`), read the input of a command only when it has
+    /// a here-document and a here-string at once, count the command word
+    /// among its own arguments (`head.at * 1`), or lose what a builtin that
+    /// gives values names (`&=`, `named && input`), and one of these places
+    /// is wrong.
+    #[test]
+    fn where_the_guards_name_stands() {
+        assert_eq!(places("ls $(echo innerwarden)"), (true, false));
+        assert_eq!(places("ls $(echo innerwarden) $(echo iw)"), (true, false));
+        assert_eq!(places("cat <<< innerwarden"), (false, true));
+        assert_eq!(places("cat <<E\ninnerwarden\nE"), (false, true));
+        assert_eq!(places("read X <<< innerwarden"), (true, false));
+        assert_eq!(places("X=innerwarden ls"), (true, false));
+        assert_eq!(places("innerwarden status"), (true, false));
+        assert_eq!(places("export X=innerwarden"), (true, false));
+        assert_eq!(places("printf -v X innerwarden"), (true, false));
+        assert_eq!(places("printf innerwarden"), (false, true));
+        assert_eq!(places("ls innerwarden"), (false, true));
+        assert_eq!(places("ls x"), (false, false));
+        assert_eq!(places("X=innerwarden innerwarden status"), (true, false));
+        assert_eq!(
+            places("export X=innerwarden; export Y=innerwarden"),
+            (true, false)
+        );
+    }
+
+    /// The name of a `${NAME}` the lexer records: letters, digits and `_`,
+    /// not starting with a digit, the braces holding nothing else.
+    ///
+    /// FAILS ON REVERT: take `_` only with a letter (`&&`), end the name at
+    /// the wrong byte, or turn any part of the guard on `${NAME}` and a name
+    /// here is recorded wrong or not at all.
+    #[test]
+    fn the_name_of_a_braced_expansion() {
+        let names = |text: &str| -> Vec<String> {
+            let lexed = Lexer::read(text.as_bytes());
+            lexed.commands[0]
+                .words
+                .iter()
+                .flat_map(|word| word.names.iter().map(|(_, name)| name.clone()))
+                .collect()
+        };
+        assert_eq!(names("echo ${A_B}x"), ["A_B"]);
+        assert_eq!(names("echo ${ABC}"), ["ABC"]);
+        assert_eq!(names("echo xx ${A1}"), ["A1"]);
+        assert_eq!(names("x ${AB}"), ["AB"]);
+        assert!(names("echo ${1}").is_empty());
+        assert!(names("echo ${1A}").is_empty());
+        assert!(names("echo ${A-x}").is_empty());
+        assert!(names("echo ${}").is_empty());
+    }
+
+    /// A name refused where it is a source in a text read inside another
+    /// text that is a source too, held where it is only an argument, and a
+    /// mention among the arguments of a program whose arguments are data.
+    ///
+    /// FAILS ON REVERT: join the places of the inner text to the outer
+    /// with `^=` and the first line is only held; take a program whose
+    /// arguments are data for one that may run them (`cmd.dynamic() &&`) and
+    /// the second is held; hold an argument the line hands on only where a
+    /// launcher and a verb both stand (`head.launched && self.verb`) and the
+    /// third is let through.
+    #[test]
+    fn a_source_inside_a_source_is_refused_and_a_mention_passes() {
+        let nested = "export X=innerwarden; sh -c 'export Y=innerwarden; $X \"$Y\"'";
+        let found = judge(nested.as_bytes(), false);
+        assert!(
+            found
+                .as_deref()
+                .is_some_and(|why| !why.starts_with("held:")),
+            "{nested}: {found:?}"
+        );
+        assert_eq!(judge(b"cp innerwarden \"$X\"", false), None);
+        assert_eq!(judge(b"sudo tar -cf x innerwarden \"$Y\"", false), None);
+        let handed = "./run x innerwarden \"$Y\"; echo monitor";
+        assert_eq!(
+            judge(handed.as_bytes(), false).as_deref(),
+            Some("held:argument-dynamic"),
+            "{handed}"
+        );
+    }
+
+    /// What a program does with its arguments is read from the words the
+    /// text shows: `cargo run` and `find -exec` run what they are handed.
+    ///
+    /// FAILS ON REVERT: read it from the words the text does not show
+    /// (`a.dynamic()`) and both are taken for programs whose arguments are
+    /// data, so the guard handed to them is let through.
+    #[test]
+    fn the_program_is_read_from_the_words_the_text_shows() {
+        for line in [
+            "sudo cargo run -p innerwarden \"$Y\"",
+            "sudo find . -exec innerwarden \"$Y\" ;",
+        ] {
+            assert_eq!(
+                judge(line.as_bytes(), false).as_deref(),
+                Some("held:argument-dynamic"),
+                "{line}"
+            );
+        }
+    }
+
+    /// A shell fed the text a command prints reads it as a line: the
+    /// guard's name in it beside a word the text does not show is refused.
+    /// A construct beside the guard's letters alone (here in a comment) is
+    /// held.
+    ///
+    /// FAILS ON REVERT: read the fed text only where the line holds no guard
+    /// word (`self.raw_only`) and the first is let through; hold only where
+    /// `raw` and `letters` stand at once and the second is.
+    #[test]
+    fn a_fed_line_is_read_and_the_guards_letters_alone_hold() {
+        assert_eq!(
+            judge(b"echo \"innerwarden $X\" | sh", false).as_deref(),
+            Some("guard-dynamic-arguments")
+        );
+        assert_eq!(
+            judge(b"$X \"$Y\" # iw_x allow", false).as_deref(),
+            Some("held:dynamic-command")
+        );
+    }
+
+    /// A value the line gives is read in place of the command word only
+    /// where the name starts it; a code string a shell runs with a value
+    /// the text does not show is refused beside the guard's name.
+    ///
+    /// FAILS ON REVERT: read a value that does not start the word
+    /// (`*at != 0 && word.glob`), or one followed by more than a path
+    /// (`&& !(rest.is_empty() || ...)`), and the first or the second is let
+    /// through; refuse the
+    /// code only where no guard word stands (`nameless`) and the second is.
+    #[test]
+    fn a_value_starts_the_word_it_stands_for_and_dynamic_code_is_refused() {
+        assert_eq!(
+            judge(b"B=/x/release/innerwarden; x$B --version", false).as_deref(),
+            Some("dynamic-command")
+        );
+        assert_eq!(
+            judge(b"B=/x/release/innerwarden; ${B}x --version", false).as_deref(),
+            Some("dynamic-command")
+        );
+        assert_eq!(
+            judge(b"B=/x/release/innerwarden; $B --version", false),
+            None
+        );
+        assert_eq!(
+            judge(b"sh -c \"echo $X\"; innerwarden status", false).as_deref(),
+            Some("dynamic-code")
+        );
+    }
 }

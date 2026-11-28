@@ -464,6 +464,152 @@ pub(super) fn removal_reaches_guard_file_from(
     walk(spelled.as_deref().unwrap_or(content), start, true).0
 }
 
+/// What [`found_guard_program_changed`] says.
+pub(super) const FOUND_GUARD_PROGRAM_CHANGED: &str = "removes, moves, overwrites, links over or \
+     changes the mode or owner of the guard's own program, named in a path the line does not \
+     show whole (a substitution, an expansion or a variable that names it, or a path that ends \
+     in its name)";
+
+/// Whether `name` (lowercase) is one of the guard's programs.
+fn is_guard_program(name: &str) -> bool {
+    let bare = name.strip_suffix(".exe").unwrap_or(name);
+    super::GUARD_PROGRAMS.contains(&bare)
+}
+
+/// Whether an operand the text does not show whole is one of the guard's
+/// programs: what the shell puts in its place (a substitution, an
+/// expansion, a pattern) names one of them anywhere in its text
+/// (`"$(which innerwarden)"`, `"$(hash -t innerwarden)"`,
+/// `"${commands[innerwarden]}"`, `"$(readlink /proc/$(pgrep -n
+/// innerwarden)/exe)"`, `$(find / -name innerwarden)`), or the path ends in
+/// one of their names (`"$(npm prefix -g)/bin/innerwarden"`, `"$D/iw"`).
+///
+/// A rule on the operand, not a list of the programs that find a path: a
+/// list named `which`, `command -v`, `type -P`, `readlink -f` and
+/// `realpath`, and `npm prefix -g`, `brew --prefix`, `hash -t`, `find`,
+/// `whereis`, a zsh `${commands[...]}` and a dozen more were each the
+/// guard's program moved aside under a name it did not read. A word the
+/// text shows whole is a path the other readings resolve; a name of the
+/// guard in the middle of a path through a value (`"$W/innerwarden/wt-1"`)
+/// is a folder, not the program.
+fn operand_names_guard_program(word: &Word) -> bool {
+    if word.is_plain() || word.marks.len() != word.text.chars().count() {
+        return false;
+    }
+    let chars: Vec<char> = word.text.chars().collect();
+    // The text the shell replaces or matches, read as words: the name is
+    // one of them (`[innerwarden]`, `innerwarden)`, `innerwarden|`).
+    let mut token = String::new();
+    let mut names = false;
+    // A subscript right after an expansion (`"$commands[innerwarden]"`,
+    // zsh's table of the programs on the search path) is the expansion's.
+    let mut subscript = false;
+    let mut last_mark = Mark::Plain;
+    for (c, mark) in chars.iter().zip(&word.marks) {
+        if *mark == Mark::Plain {
+            if *c == '[' && last_mark == Mark::Expansion {
+                subscript = true;
+            } else if *c == ']' {
+                subscript = false;
+            }
+        }
+        last_mark = *mark;
+        let replaced = *mark != Mark::Plain || subscript;
+        let part_of_a_name =
+            replaced && (c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'));
+        if part_of_a_name {
+            token.push(c.to_ascii_lowercase());
+            continue;
+        }
+        names |= is_guard_program(&token);
+        token.clear();
+    }
+    names |= is_guard_program(&token);
+    if names {
+        return true;
+    }
+    // The last part of the path, past the last `/` the shell leaves as it
+    // is, as written.
+    let start = chars
+        .iter()
+        .zip(&word.marks)
+        .rposition(|(c, mark)| *c == '/' && *mark == Mark::Plain)
+        .map(|at| at + 1);
+    start.is_some_and(|start| {
+        word.marks[start..].iter().all(|mark| *mark == Mark::Plain)
+            && is_guard_program(
+                &chars[start..]
+                    .iter()
+                    .collect::<String>()
+                    .to_ascii_lowercase(),
+            )
+    })
+}
+
+/// Whether a command of the line removes, moves, overwrites, links over or
+/// changes the mode or owner of one of the guard's programs named in an
+/// operand the text does not show whole ([`operand_names_guard_program`]):
+/// `mv "$(which innerwarden)" /tmp/x`, `rm -f "$(hash -t innerwarden)"`,
+/// `mv "$(npm prefix -g)/bin/innerwarden" /tmp/x`, `cp /bin/true
+/// "${commands[innerwarden]}"`, `chmod 000 "$(type -P innerwarden)"`, a
+/// redirection or `tee` into one. A copy from it, a listing or a hash of it
+/// reads it, and is not here.
+///
+/// Measured 2026-11-28 on pull request #471: each of those was held for
+/// review as a value the line does not show, or let through, while main
+/// refused it and the same line with the path written out is refused.
+pub(super) fn found_guard_program_changed(content: &str) -> bool {
+    if !(content.contains('$') || content.contains('`')) {
+        return false;
+    }
+    let line = read_line(content);
+    line.commands.iter().any(|command| {
+        if command.writes.iter().any(operand_names_guard_program) {
+            return true;
+        }
+        let texts: Vec<String> = command.words.iter().map(|w| w.text.clone()).collect();
+        let Some(at) = effective_command_index(&texts) else {
+            return false;
+        };
+        let program = program_name(&texts[at]);
+        let args = &command.words[at + 1..];
+        let operands: Vec<&Word> = args
+            .iter()
+            .filter(|word| !(word.is_plain() && word.text.starts_with('-')))
+            .collect();
+        match program.as_str() {
+            // What it takes away, moves aside, empties or changes.
+            "rm" | "unlink" | "shred" | "truncate" | "mv" | "chmod" | "chown" | "chgrp"
+            | "chattr" | "setfacl" | "trash" | "trash-put" | "tee" => {
+                operands.into_iter().any(operand_names_guard_program)
+            }
+            // What it writes over: the last operand, the name it makes.
+            "cp" | "install" | "ln" | "rsync" => operands
+                .last()
+                .is_some_and(|word| operand_names_guard_program(word)),
+            "dd" => args
+                .iter()
+                .any(|word| word.text.starts_with("of=") && operand_value_names_guard(word, 3)),
+            _ => false,
+        }
+    })
+}
+
+/// [`operand_names_guard_program`] of the value after the first `skip`
+/// characters of `word` (`of=$(which innerwarden)`).
+fn operand_value_names_guard(word: &Word, skip: usize) -> bool {
+    // A mark a character: past the marks there is no value.
+    if word.marks.len() <= skip {
+        return false;
+    }
+    let value = Word {
+        text: word.text.chars().skip(skip).collect(),
+        marks: word.marks[skip..].to_vec(),
+        ..Word::default()
+    };
+    operand_names_guard_program(&value)
+}
+
 /// Whether a command of the line removes, moves, edits or writes a path
 /// under a `HOME` the line gave a value it does not show (`read -r HOME <
 /// <(...)`, `mapfile HOME`, a `read` from the terminal) that can be a file
@@ -1042,5 +1188,41 @@ mod tests {
             Some(Some("/tmp/x y".to_owned()))
         );
         assert_eq!(read_value("-p HOME A", "/tmp/x"), None);
+    }
+
+    /// The rule on the operand, read alone: the program each command
+    /// changes is found where it stands, `dd` by its `of=`, a plain path is
+    /// left to the readings that resolve it, and a reader changes nothing.
+    ///
+    /// FAILS ON REVERT: take `dd` out of `found_guard_program_changed`, or
+    /// answer `operand_value_names_guard` with `false`, and the `dd` line is
+    /// not found; read a plain word as one the text does not show
+    /// (`operand_names_guard_program` without its `is_plain` answer) and the
+    /// plain build path is.
+    #[test]
+    fn the_guards_program_in_an_operand_not_shown_whole_is_read_alone() {
+        for line in [
+            "dd if=/dev/zero of=\"$(which innerwarden)\"",
+            "dd of=$(hash -t innerwarden) if=/dev/zero",
+            "mv \"${commands[innerwarden]}\" /tmp/x",
+            "cp /bin/true \"$D/iw\"",
+            "echo x | tee -a \"$(command -v iw-guard)\"",
+            ": > \"$(npm prefix -g)/bin/innerwarden-ctl\"",
+            "mv \"$(command -v innerwarden || command -v iw)\" /tmp/x",
+            "rm -f \"$(which iw)$innerwarden\"",
+        ] {
+            assert!(found_guard_program_changed(line), "{line}");
+        }
+        for line in [
+            "mv ./build/innerwarden \"$OUT\"",
+            "dd if=\"$(which innerwarden)\" of=/tmp/copy",
+            "dd of=",
+            "cp \"$(which innerwarden)\" /tmp/copy",
+            "sha256sum \"$(which innerwarden)\"",
+            "mv \"$W/innerwarden/wt-1\" /tmp/old",
+            "mv /usr/local/bin/innerwarden /tmp/x",
+        ] {
+            assert!(!found_guard_program_changed(line), "{line}");
+        }
     }
 }

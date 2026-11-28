@@ -951,7 +951,7 @@ real	real-026	deny
 real	real-027	allow
 real	real-028	deny
 real	real-029	deny
-real	real-030	deny
+real	real-030	review
 real	real-031	allow
 real	real-032	deny
 real	real-033	deny
@@ -1206,7 +1206,7 @@ own-work	own-011	allow
 own-work	own-012	allow
 own-work	own-013	review
 own-work	own-014	review
-own-work	own-015	review
+own-work	own-015	allow
 own-work	own-016	review
 own-work	own-017	allow
 own-work	own-018	allow
@@ -1239,11 +1239,11 @@ own-work	own-044	allow
 own-work	own-045	review
 own-work	own-046	review
 own-work	own-047	allow
-own-work	own-048	review
+own-work	own-048	allow
 own-work	own-049	allow
 own-work	own-050	allow
 own-work	own-051	allow
-own-work	own-052	review
+own-work	own-052	allow
 own-work	own-053	review
 own-work	own-054	review
 own-work	own-055	review

@@ -66,4 +66,57 @@ exclude_re = [
   # the mutants run (Linux), so no test there can reach it; the unix one is
   # the one tested.
   'src/private_temp\.rs:198:5: replace is_private -> bool with true',
+  # A word that starts `--` starts its letters with `-`, so the letters
+  # before an `o` hold that `-` and are never all letters and digits: the
+  # arm of a long option and the arm of a short one answer the same.
+  "threats/program_places\\.rs:388:34: replace match guard !letters\\.starts_with\\('-'\\) with true in ssh_local_commands",
+  # `words[at * 1..]` adds the program word to its operands, and that word
+  # is plain: `operand_names_guard_program` never takes a plain word.
+  'threats/guard_file_targets\.rs:575:38: replace \+ with \* in found_guard_program_changed',
+  # `texts[at * 1..]` adds the program word (`scp`, `sftp`) to its own
+  # arguments, and a program's name is no `-o` setting.
+  'threats/program_places\.rs:446:41: replace \+ with \* in ssh_local_commands_of',
+  # The `;` that ends what `fd -x` runs is looked for from the word after
+  # `-x`; from `-x` itself (`exec * 1`) the first word read is `-x`, which is
+  # no `;`, and the end found is the same.
+  'threats/program_places\.rs:565:33: replace \+ with \* in fill',
+  # The word at `agent` says `agent`, not `kernel`: the first `kernel` from
+  # it on is the first from the word after it.
+  'threats/words_after\.rs:585:33: replace \+ with \* in WordsAfter::kernel_verbs_written_after',
+  # `before[first * 1]` keeps the name itself at the head of the words read
+  # for a verb, and a name of the guard is never one of the verbs read
+  # (`allow`, `mute`, `monitor`, `dry-run`, `uninstall`).
+  'src/threats\.rs:7220:52: replace \+ with \* in guard_cli_named_later_loosens',
+  # Past the first answer, a word not shown whole that names a guard
+  # program by its last part is one to `guard_program` already, and its
+  # glued value names none otherwise: going on to read it answers the same.
+  'src/threats\.rs:5089:66: replace \|\| with && in guard_program_or_glued',
+  'src/threats\.rs:5089:46: replace \|\| with && in guard_program_or_glued',
+  # An assignment word with an expansion spelled as a command line is that
+  # assignment again, and its value is read as text kept to run later where
+  # the line gives it (`runs_text_of`): spelling it finds nothing more.
+  'src/threats\.rs:5699:13: replace \|\| with && in command_lines_spelled',
+  # The word at `assigns_to` is the program a command runs, never a
+  # `NAME=value`: taking it among the assignments changes nothing.
+  'src/threats\.rs:4743:30: replace < with <= in guard_words_found_within',
+  # A substitution read at the level of the text around it is read again at
+  # each level of the substitutions nested in it: a line of nested
+  # substitutions is then read past the per-mutant timeout. The run reports
+  # it as a timeout, never as a wrong answer, and the level is held by
+  # `the_levels_of_store_reads_and_removals_end_past_the_last_one`.
+  'src/threats\.rs:22406:50: replace \+ with \* in runs_a_removal',
+  # `aside` is set only where a word holds the guard's letters, and
+  # `letters` holds them for the whole text: a construct beside it is held
+  # either way, so dropping or flipping `aside` changes no answer.
+  'guard_doubt/rules\.rs:1222:20: replace \|= with \^= in Judge::context',
+  'guard_doubt/rules\.rs:1222:20: replace \|= with &= in Judge::context',
+  'guard_doubt/rules\.rs:1261:23: replace \|\| with && in Judge::doubt',
+  'guard_doubt/rules\.rs:1261:36: replace \|\| with && in Judge::doubt',
+  'guard_doubt/rules\.rs:1165:19: replace \|= with \^= in name_places',
+  'guard_doubt/rules\.rs:1165:19: replace \|= with &= in name_places',
+  'guard_doubt/rules\.rs:1179:19: replace \|= with \^= in name_places',
+  # A value read in place of `$NAME` whose rest holds an expansion keeps that
+  # expansion in the word it makes, which is read as a command word not
+  # shown whole either way.
+  'guard_doubt/rules\.rs:1238:13: replace \|\| with && in Judge::resolved',
 ]

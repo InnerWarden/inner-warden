@@ -6350,12 +6350,22 @@ fn analyze_command_as_read(
     .filter_map(threats::check_security_tamper)
     .max_by_key(|(_, s)| *s);
     if let Some((indicator, s)) = tamper {
-        signals.push(AnalysisSignal {
-            signal: "security_tooling_tamper".into(),
-            score: s,
-            detail: format!("disabling or tampering with security monitoring: `{indicator}`"),
-        });
-        score += s;
+        let detail = format!("disabling or tampering with security monitoring: `{indicator}`");
+        // A read of the guard's store is charged once: the line `ssh` runs
+        // on another host, judged above, holds the same read the line read
+        // whole holds, and two of them would be a refusal of a read.
+        let charged = indicator == threats::GUARD_STORE_READ
+            && signals.iter().any(|seen| {
+                seen.signal == "security_tooling_tamper" && seen.detail.ends_with(&detail)
+            });
+        if !charged {
+            signals.push(AnalysisSignal {
+                signal: "security_tooling_tamper".into(),
+                score: s,
+                detail,
+            });
+            score += s;
+        }
     }
 
     // A write into an open file of another process (`> /proc/1234/fd/0`)
