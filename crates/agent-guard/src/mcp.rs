@@ -6993,6 +6993,68 @@ fn check_shell_internal_target(command: &str) -> Option<String> {
 mod tests {
     use super::*;
 
+    /// A line held for a mention is named by the findings that charged it:
+    /// an attack's words only when one of them charged the line. A finding
+    /// scored 0 (a subsumed duplicate) never decides, so it does not name
+    /// the lowered line either.
+    ///
+    /// FAILS ON REVERT of the charged-only test in [`mention_only`]: a
+    /// subsumed reverse shell beside the guard's words named the line as
+    /// an attack's words.
+    #[test]
+    fn a_subsumed_attack_finding_does_not_name_a_mention() {
+        let signal = |name: &str, score: u32| AnalysisSignal {
+            signal: name.into(),
+            score,
+            detail: name.into(),
+        };
+        let verdict = |signals: Vec<AnalysisSignal>| {
+            let risk_score = signals.iter().map(|s| s.score).sum();
+            CommandAnalysis {
+                command: String::new(),
+                risk_score,
+                severity: "high".into(),
+                signals,
+                recommendation: recommendation_for_score(risk_score).into(),
+                explanation: String::new(),
+                atr_matches: Vec::new(),
+                asi_ids: Vec::new(),
+            }
+        };
+        let line = "grep -rn innerwarden-agent src";
+        let allowed = |_: &str| verdict(Vec::new());
+        let named = |signals: Vec<AnalysisSignal>| {
+            mention_only(line, None, verdict(signals), allowed)
+                .signals
+                .into_iter()
+                .filter(|s| s.score > 0)
+                .map(|s| s.signal)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            named(vec![
+                signal("guard_self_disable", 60),
+                signal("reverse_shell", 0)
+            ]),
+            vec!["guard_word_mention".to_string()]
+        );
+        assert_eq!(
+            named(vec![
+                signal("guard_self_disable", 60),
+                signal("reverse_shell", 60)
+            ]),
+            vec!["attack_text_as_data".to_string()]
+        );
+        // A subsumed finding of another family does not keep the refusal.
+        assert_eq!(
+            named(vec![
+                signal("guard_self_disable", 60),
+                signal("download_and_execute", 0)
+            ]),
+            vec!["guard_word_mention".to_string()]
+        );
+    }
+
     /// A name the remote line is charged with is a name a check raises: a
     /// misspelt one would leave that finding uncharged on the other host.
     #[test]

@@ -32060,6 +32060,74 @@ mod round_three_rule_tests {
         }
     }
 
+    /// A delete of a variable is waived only when the line gives the value
+    /// and the delete is there to judge: a line with no recursive delete
+    /// once its values are read in waives nothing.
+    #[test]
+    fn a_variable_delete_is_waived_only_for_a_delete_it_can_judge() {
+        let unseen = regex::Regex::new(
+            r#"(?i)\brm\b[^|;&]*-[a-z]*r[a-z]*f?[^|;&]*\s["']?\$\{?[A-Z_][A-Z0-9_]*\}?["']?/"#,
+        )
+        .expect("the variable target pattern");
+        assert!(delete_variable_names_a_subfolder(
+            "D=/home/u/work/proj/build; rm -rf \"$D/\"",
+            &unseen
+        ));
+        assert!(!delete_variable_names_a_subfolder(
+            "rm -rf \"$D/\"",
+            &unseen
+        ));
+        assert!(!delete_variable_names_a_subfolder(
+            "D=/home/u/work/proj/build; ls \"$D/\"",
+            &unseen
+        ));
+    }
+
+    /// The path a variable target resolves to is one folder of the work only
+    /// below a folder of its own: never the root, a top-level folder, a
+    /// folder of the system at any depth, a home or the folder of homes,
+    /// macOS's `/private/<x>`, a climb, a glob in the first two places, the
+    /// working folder, or a target that still holds a variable.
+    #[test]
+    fn a_resolved_delete_target_is_one_folder_only_below_one_of_its_own() {
+        for target in [
+            "/home/u/work/proj/build",
+            "/home/u/work/proj/build/",
+            "/tmp/x1",
+            "/private/tmp/s1/out",
+            "/private/tmp/s1",
+            "/Users/u/work/out",
+            "build/out",
+            "~/work/out",
+        ] {
+            assert!(resolved_delete_target_is_one_folder(target), "{target}");
+        }
+        for target in [
+            "",
+            "/",
+            "/x",
+            "/etc",
+            "/etc/x",
+            "/srv/app/data",
+            "/usr/local/lib",
+            "/home",
+            "/home/u",
+            "/Users/u/",
+            "/private/tmp",
+            "/private/var/",
+            "/a/*/b",
+            "/home/u/work/../..",
+            "../x",
+            ".",
+            "./",
+            "~",
+            "$X/a",
+            "`pwd`/a",
+        ] {
+            assert!(!resolved_delete_target_is_one_folder(target), "{target}");
+        }
+    }
+
     /// And the ordinary version of each verb is untouched, which is the half
     /// that decides whether the rule survives contact with a real team.
     #[test]

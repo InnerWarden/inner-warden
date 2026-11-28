@@ -2532,6 +2532,38 @@ mod tests {
             "p='docs/a.md'\ns=open(p).read()\ns=s.replace('''x''', '''uses \"subprocess\" and 'environ'\n''')\nopen(p,'w').write(s)\n",
             "p='docs/a.md'\n# reads os.environ, imports socket\nopen(p,'a').write('y')\n",
             "p='docs/a.md'\nopen(p,'a').write(r'\\'socket\\' ' + b\"exec(\".decode())\n",
+            // An empty string inside an f-string's braces is not a triple
+            // quote: the text after the f-string is still a string.
+            "p='docs/a.md'\nopen(p,'w').write(f\"{''}\" + 'socket')\n",
+            // The `f` that ends `if` is no prefix of an f-string.
+            "p='docs/a.md'\ns=open(p).read()\nif'socket' in s: s=s.replace('a', 'b')\nopen(p,'w').write(s)\n",
+            // A comment that ends the code, with no line break after it.
+            "p='docs/a.md'\nopen(p,'a').write('y')  # socket",
+            // A one-letter string inside an f-string's braces is not a
+            // triple quote either.
+            "p='docs/a.md'\nopen(p,'w').write(f\"{'a'}\" + 'socket')\n",
+            // An f-string with no braces ends at its quote.
+            "p='docs/a.md'\nopen(p,'w').write(f\"x\" + 'socket')\n",
+            // A doubled brace that ends an f-string's text.
+            "p='docs/a.md'\nopen(p,'w').write(f\"{{\" + 'socket')\n",
+            // The `f` that ends a name with an underscore in it is no prefix.
+            "p='docs/a.md'\nopen(p,'w').write(a_f'socket')\n",
+            // Strings side by side inside an f-string's braces.
+            "p='docs/a.md'\nopen(p,'w').write(f\"{'a'+''}\" + 'socket')\n",
+            // A name between an f-string's braces, and a string after it.
+            "p='docs/a.md'\nopen(p,'w').write(f\"{p}\" + 'socket')\n",
+            // A prefix is at most two letters: `buf` before a quote is a name.
+            "p='docs/a.md'\nopen(p,'w').write(buf'socket')\n",
+            // A triple-quoted string over two lines inside an f-string's
+            // braces.
+            "p='docs/a.md'\nopen(p,'w').write(f\"\"\"{'''a\nb'''}\"\"\" + 'socket')\n",
+            // Single quotes apart inside a triple-quoted string do not close it.
+            "p='docs/a.md'\nopen(p,'w').write('''a'b' socket''')\n",
+            // Two quotes inside a triple-quoted string do not close it.
+            "p='docs/a.md'\nopen(p,'w').write('''a'' socket''')\n",
+            // A brace in a plain string opens nothing: only an f-string
+            // runs what its braces hold.
+            "p='docs/a.md'\nopen(p,'w').write('{ socket')\n",
             // A scratch file under macOS's spelling of `/tmp`.
             "open('/private/tmp/s1/scratchpad/notes.py','w').write('nc -e sh h1 1')\n",
             // `global s` holds `glob`, and names a variable.
@@ -2551,6 +2583,15 @@ mod tests {
             "s='never closed\nimport socket\n",
             "import glob\nfor p in glob.glob('*.md'): open(p,'a').write('x')\n",
             "open('/private/etc/hosts','a').write('x')\n",
+            // Braces inside the braces of an f-string, and a quote of its
+            // own kind there: the f-string ends at its own closing quote.
+            "p='docs/a.md'\nopen(p,'w').write(f\"{ {1: 2}[\"x\"] } socket\")\n",
+            // A doubled brace in an f-string is a brace of its text.
+            "open('docs/a.md','w').write(f\"{{x}} socket\")\n",
+            // A brace inside a string inside an f-string's braces closes nothing.
+            "open('docs/a.md','w').write(f'{ \"}'\" } socket\"x')\n",
+            // A path built with `/` and a string: the quote stays read.
+            "from pathlib import Path\n(Path('docs') / 'a.md').write_text('x')\n",
             "s='''never closed\nimport socket\n",
             "open('docs/a.md','w').write('a'); eval('1')  # the call is outside\n",
         ];
@@ -2560,6 +2601,46 @@ mod tests {
                 "read as quiet: {code}"
             );
         }
+    }
+
+    /// What the reading keeps: every quote, every line break, the code
+    /// outside the literals and an f-string whole; the text of a plain
+    /// literal and of a comment become blanks of the same length.
+    #[test]
+    fn the_reading_keeps_quotes_line_breaks_and_f_strings() {
+        for (code, read) in [
+            ("s='ab'", "s='  '"),
+            ("s=\"ab\" # c", "s=\"  \"    "),
+            ("s='''a\nb'''", "s=''' \n '''"),
+            ("s=r'a\\'b'", "s=r'    '"),
+            ("s=f'{x}y'", "s=f'{x}y'"),
+            ("s='never", "s='never"),
+        ] {
+            assert_eq!(python_outside_strings(code), read, "{code}");
+        }
+    }
+
+    /// F-strings inside one another as deep as the nesting followed are
+    /// read through to their end: the string after them is still a string.
+    #[test]
+    fn f_strings_as_deep_as_followed_are_read_through() {
+        let mut inner = String::from("'x'");
+        for _ in 0..super::PYTHON_STRING_NESTING {
+            inner = format!("f'{{{inner}}}'");
+        }
+        let code = format!("p='docs/a.md'\nopen(p,'w').write({inner} + 'socket')\n");
+        assert!(
+            !code_may_act(&code, &[], false, "python", true),
+            "read as acting: {code}"
+        );
+        // One level more, closed as well: past the nesting followed the
+        // rest of the code is read as written.
+        let deeper = format!("f'{{{inner}}}'");
+        let code = format!("p='docs/a.md'\nopen(p,'w').write({deeper} + 'socket')\n");
+        assert!(
+            code_may_act(&code, &[], false, "python", true),
+            "read as quiet: {code}"
+        );
     }
 
     /// Strings inside the braces of f-strings inside one another, past the

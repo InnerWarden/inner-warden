@@ -368,6 +368,23 @@ mod tests {
         ));
     }
 
+    /// What `status` says each posture refuses names the class as it is.
+    #[test]
+    fn the_summary_names_what_each_posture_refuses() {
+        let default = refuses_summary(Posture::Default);
+        for class in [
+            "secret reads",
+            "a cloud resource",
+            "reverse shells",
+            "metadata service",
+            "preloaded from a temp folder",
+            "download-and-run",
+        ] {
+            assert!(default.contains(class), "{class}: {default}");
+        }
+        assert!(refuses_summary(Posture::Strict).contains("every review"));
+    }
+
     /// The class as the engine raises it, line by line: a reworded finding
     /// or a renamed signal fails here instead of dropping out of the class.
     #[test]
