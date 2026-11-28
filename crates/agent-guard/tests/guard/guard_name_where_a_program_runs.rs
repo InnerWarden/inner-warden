@@ -355,12 +355,19 @@ fn a_command_an_ssh_client_runs_from_its_options_is_where_a_program_runs() {
     );
 }
 
-/// The guard's program found by a substitution that prints its path, then
-/// moved, removed, overwritten, linked over or changed, is refused as the
-/// path written out is. A copy from it, a listing or a hash of it reads it.
+/// The guard's program named in an operand the line does not show whole
+/// (what a substitution, an expansion or a pattern puts there names it, or
+/// the path ends in its name), then moved, removed, overwritten, linked over
+/// or changed, is refused as the path written out is, whatever program
+/// found it. A copy from it, a listing or a hash of it reads it, and a name
+/// of the guard in the middle of a path through a value is a folder.
 ///
 /// FAILS ON REVERT: leave `found_guard_program_changed` out of
-/// `check_guard_takedown` and these lines are held for review only.
+/// `check_guard_takedown` and these lines are held for review only, or let
+/// through (`npm prefix -g`, `brew --prefix`); read a list of the programs
+/// that print a path instead of the operand (`operand_names_guard_program`
+/// answering only for `which`, `command -v`, `type -P`, `readlink -f`,
+/// `realpath`) and the lines from `npm prefix -g` on are.
 #[test]
 fn the_guards_program_found_by_a_substitution_and_moved_is_refused() {
     check(
@@ -380,9 +387,39 @@ fn the_guards_program_found_by_a_substitution_and_moved_is_refused() {
             "truncate -s0 \"$(which innerwarden)\"",
             ": > \"$(which innerwarden)\"",
             "echo x | tee \"$(command -v innerwarden)\"",
+            "mv \"$(npm prefix -g)/bin/innerwarden\" /tmp/x",
+            "mv \"$(brew --prefix)/bin/innerwarden\" /tmp/x",
+            "mv \"$(npm root -g)/innerwarden/bin/innerwarden\" /tmp/x",
+            "mv \"$(hash -t innerwarden)\" /tmp/x",
+            "mv $(find / -name innerwarden -type f 2>/dev/null) /tmp/x",
+            "mv \"$(whereis -b innerwarden | cut -d' ' -f2)\" /tmp/x",
+            "mv \"${commands[innerwarden]}\" /tmp/x",
+            "mv \"$commands[innerwarden]\" /tmp/x",
+            "mv ${commands[innerwarden]} /tmp/x",
+            "mv \"$(readlink /proc/$(pgrep -n innerwarden)/exe)\" /tmp/x",
+            "mv \"$(dirname \"$(which innerwarden)\")/innerwarden\" /tmp/x",
+            "mv \"$(PATH=/usr/local/bin command -v innerwarden)\" /tmp/x",
+            "mv \"$(builtin command -v innerwarden)\" /tmp/x",
+            "mv \"$(ps -o comm= -C innerwarden)\" /tmp/x",
+            "ln -sf /bin/true \"${commands[innerwarden]}\"",
+            "chmod 000 \"${commands[innerwarden]}\"",
+            "rm -f $(echo /usr/local/bin/innerwarden)",
+            "echo x > \"$(npm prefix -g)/bin/innerwarden\"",
         ],
         "deny",
     );
+    for line in [
+        "mv \"$(npm prefix -g)/bin/other\" /tmp/x",
+        "mv \"$W/innerwarden/wt-1\" /tmp/old",
+        "ls -la \"$(npm prefix -g)/bin/innerwarden\"",
+    ] {
+        let analysis = analyze_command(line, None);
+        assert_ne!(
+            analysis.recommendation, "deny",
+            "{line}: {:?}",
+            analysis.signals
+        );
+    }
     check(
         &[
             "ls -la \"$(which innerwarden)\"",

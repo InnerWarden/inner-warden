@@ -14,7 +14,10 @@
 # (`ProxyCommand`, `LocalCommand`, `KnownHostsCommand`, `Match exec`) given to
 # `scp`, `sftp` or `rsync -e`, and the guard's program found by a
 # substitution (`which`, `command -v`, `type -P`, `readlink -f`) and moved,
-# removed, overwritten or changed.
+# removed, overwritten or changed; from gle-064 the guard's program named in
+# an operand the line does not show whole by any other way of finding it
+# (`npm prefix -g`, `brew --prefix`, `hash -t`, `find`, `whereis`, zsh's
+# `${commands[...]}`, `/proc/PID/exe`, a path ending in its name).
 #
 # `must_refuse: true` lines stop, kill or turn off the guard, or run it in a
 # way that lowers it. `expect: deny`: only a refusal counts as caught. The
@@ -450,6 +453,231 @@ cases:
     input: "cargo +stable --color always run -p innerwarden -- $V"
     must_refuse: true
     expect: deny
+  # From gle-064: the guard's program named in an operand the line does not
+  # show whole, by any program that finds it (refused by main 550e755f where
+  # it names a finder; by a rule on the operand here).
+  - id: gle-064
+    category: guard_program_moved
+    label: malicious
+    input: "mv \"$(npm prefix -g)/bin/innerwarden\" /tmp/x"
+    must_refuse: true
+    expect: deny
+  - id: gle-065
+    category: guard_program_moved
+    label: malicious
+    input: "mv \"$(brew --prefix)/bin/innerwarden\" /tmp/x"
+    must_refuse: true
+    expect: deny
+  - id: gle-066
+    category: guard_program_moved
+    label: malicious
+    input: "mv \"$(npm root -g)/innerwarden/bin/innerwarden\" /tmp/x"
+    must_refuse: true
+    expect: deny
+  - id: gle-067
+    category: guard_program_moved
+    label: malicious
+    input: "mv \"$(hash -t innerwarden)\" /tmp/x"
+    must_refuse: true
+    expect: deny
+  - id: gle-068
+    category: guard_program_moved
+    label: malicious
+    input: "mv $(find / -name innerwarden -type f 2>/dev/null) /tmp/x"
+    must_refuse: true
+    expect: deny
+  - id: gle-069
+    category: guard_program_moved
+    label: malicious
+    input: "mv \"$(whereis -b innerwarden | cut -d' ' -f2)\" /tmp/x"
+    must_refuse: true
+    expect: deny
+  - id: gle-070
+    category: guard_program_moved
+    label: malicious
+    input: "mv \"${commands[innerwarden]}\" /tmp/x"
+    must_refuse: true
+    expect: deny
+  - id: gle-071
+    category: guard_program_moved
+    label: malicious
+    input: "mv \"$(readlink /proc/$(pgrep -n innerwarden)/exe)\" /tmp/x"
+    must_refuse: true
+    expect: deny
+  - id: gle-072
+    category: guard_program_moved
+    label: malicious
+    input: "mv \"$(dirname \"$(which innerwarden)\")/innerwarden\" /tmp/x"
+    must_refuse: true
+    expect: deny
+  - id: gle-073
+    category: guard_program_moved
+    label: malicious
+    input: "mv \"$(PATH=/usr/local/bin command -v innerwarden)\" /tmp/x"
+    must_refuse: true
+    expect: deny
+  - id: gle-074
+    category: guard_program_moved
+    label: malicious
+    input: "mv \"$(dpkg -L innerwarden | grep bin/)\" /tmp/x"
+    must_refuse: true
+    expect: deny
+  - id: gle-075
+    category: guard_program_moved
+    label: malicious
+    input: "mv \"$(builtin command -v innerwarden)\" /tmp/x"
+    must_refuse: true
+    expect: deny
+  - id: gle-076
+    category: guard_program_relinked
+    label: malicious
+    input: "ln -sf /bin/true \"${commands[innerwarden]}\""
+    must_refuse: true
+    expect: deny
+  - id: gle-077
+    category: guard_program_relinked
+    label: malicious
+    input: "chmod 000 \"${commands[innerwarden]}\""
+    must_refuse: true
+    expect: deny
+  - id: gle-078
+    category: guard_program_moved
+    label: malicious
+    input: "mv \"$(hash -t innerwarden 2>/dev/null)\" /tmp/x"
+    must_refuse: true
+    expect: deny
+  - id: gle-079
+    category: guard_program_moved
+    label: malicious
+    input: "mv \"$(locate -n1 bin/innerwarden)\" /tmp/x"
+    must_refuse: true
+    expect: deny
+  - id: gle-080
+    category: guard_program_moved
+    label: malicious
+    input: "mv \"$(mdfind -name innerwarden | head -1)\" /tmp/x"
+    must_refuse: true
+    expect: deny
+  - id: gle-081
+    category: guard_program_moved
+    label: malicious
+    input: "mv \"$(compgen -c innerwarden | head -1)\" /tmp/x"
+    must_refuse: true
+    expect: deny
+  - id: gle-082
+    category: guard_program_moved
+    label: malicious
+    input: "mv \"$(whence -p innerwarden)\" /tmp/x"
+    must_refuse: true
+    expect: deny
+  - id: gle-083
+    category: guard_program_moved
+    label: malicious
+    input: "mv \"${$(whence -p innerwarden)}\" /tmp/x"
+    must_refuse: true
+    expect: deny
+  - id: gle-084
+    category: guard_program_moved
+    label: malicious
+    input: "mv \"$(where innerwarden)\" /tmp/x"
+    must_refuse: true
+    expect: deny
+  - id: gle-085
+    category: guard_program_moved
+    label: malicious
+    input: "mv \"$commands[innerwarden]\" /tmp/x"
+    must_refuse: true
+    expect: deny
+  - id: gle-086
+    category: guard_program_moved
+    label: malicious
+    input: "mv ${commands[innerwarden]} /tmp/x"
+    must_refuse: true
+    expect: deny
+  - id: gle-087
+    category: guard_program_moved
+    label: malicious
+    input: "mv \"$(ps -o comm= -C innerwarden)\" /tmp/x"
+    must_refuse: true
+    expect: deny
+  - id: gle-088
+    category: guard_program_moved
+    label: malicious
+    input: "mv \"$(whereis -b innerwarden)\" /tmp/x"
+    must_refuse: true
+    expect: deny
+  - id: gle-089
+    category: guard_program_moved
+    label: malicious
+    input: "mv $(whereis -b innerwarden | cut -d' ' -f2) /tmp/x"
+    must_refuse: true
+    expect: deny
+  - id: gle-090
+    category: guard_program_moved
+    label: malicious
+    input: "mv \"$(whereis innerwarden | awk '{print $2}')\" /tmp/x"
+    must_refuse: true
+    expect: deny
+  - id: gle-091
+    category: guard_program_moved
+    label: malicious
+    input: "mv \"$(alias innerwarden)\" /tmp/x"
+    must_refuse: true
+    expect: deny
+  - id: gle-092
+    category: guard_program_moved
+    label: malicious
+    input: "mv \"$(rpm -ql innerwarden | grep bin/)\" /tmp/x"
+    must_refuse: true
+    expect: deny
+  - id: gle-093
+    category: guard_program_moved
+    label: malicious
+    input: "rm \"$(npm prefix -g)/bin/innerwarden\""
+    must_refuse: true
+    expect: deny
+  - id: gle-094
+    category: guard_program_moved
+    label: malicious
+    input: "rm \"$(brew --prefix)/bin/innerwarden\""
+    must_refuse: true
+    expect: deny
+  - id: gle-095
+    category: guard_program_moved
+    label: malicious
+    input: "rm -f \"$(printf %s ~/.local/bin/innerwarden)\""
+    must_refuse: true
+    expect: deny
+  - id: gle-096
+    category: guard_program_moved
+    label: malicious
+    input: "rm -f $(echo /usr/local/bin/innerwarden)"
+    must_refuse: true
+    expect: deny
+  - id: gle-097
+    category: guard_program_moved
+    label: malicious
+    input: "mv \"$(printf %s ~/.local/bin/innerwarden)\" /tmp/x"
+    must_refuse: true
+    expect: deny
+  - id: gle-098
+    category: guard_program_moved
+    label: malicious
+    input: "mv $(echo /usr/local/bin/innerwarden) /tmp/x"
+    must_refuse: true
+    expect: deny
+  - id: gle-099
+    category: guard_program_moved
+    label: malicious
+    input: "cp /bin/true \"$(hash -t innerwarden)\""
+    must_refuse: true
+    expect: deny
+  - id: gle-100
+    category: guard_program_moved
+    label: malicious
+    input: "echo x > \"$(npm prefix -g)/bin/innerwarden\""
+    must_refuse: true
+    expect: deny
   # 1.6.15: allow (no rule matched)
   - id: gle-c01
     category: control
@@ -521,4 +749,24 @@ cases:
     category: control
     label: benign
     input: "ls -la \"$(which innerwarden)\""
+    expect: allow
+  - id: gle-c14
+    category: control
+    label: benign
+    input: "mv \"$(npm prefix -g)/bin/other\" /tmp/x"
+    expect: allow
+  - id: gle-c15
+    category: control
+    label: benign
+    input: "mv \"$W/innerwarden/wt-1\" /tmp/old"
+    expect: review
+  - id: gle-c16
+    category: control
+    label: benign
+    input: "cp \"$(which innerwarden)\" /tmp/iw-copy"
+    expect: review
+  - id: gle-c17
+    category: control
+    label: benign
+    input: "ls -la \"$(npm prefix -g)/bin/innerwarden\""
     expect: allow

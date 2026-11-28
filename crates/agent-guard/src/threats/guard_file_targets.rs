@@ -466,143 +466,105 @@ pub(super) fn removal_reaches_guard_file_from(
 
 /// What [`found_guard_program_changed`] says.
 pub(super) const FOUND_GUARD_PROGRAM_CHANGED: &str = "removes, moves, overwrites, links over or \
-     changes the mode or owner of the guard's own program, found by a substitution that \
-     prints its path (which, command -v, type -P, readlink -f, realpath)";
+     changes the mode or owner of the guard's own program, named in a path the line does not \
+     show whole (a substitution, an expansion or a variable that names it, or a path that ends \
+     in its name)";
 
-/// The programs that print where a program is (`which innerwarden`,
-/// `command -v`, `type -P`) or what a path is once its links are followed
-/// (`readlink -f`, `realpath`).
-const PATH_FINDERS: &[&str] = &[
-    "which",
-    "command",
-    "type",
-    "readlink",
-    "greadlink",
-    "realpath",
-    "grealpath",
-];
-
-/// How deep a finder's operand that is a finder itself is followed
-/// (`$(readlink -f "$(which innerwarden)")`).
-const FINDER_DEPTH: u8 = 3;
-
-/// Whether the command line `text` of a substitution prints the path of one
-/// of the guard's programs: a finder ([`PATH_FINDERS`]) given its name, a
-/// path to it, or a substitution that does.
-fn prints_guard_program_path(text: &str, depth: u8) -> bool {
-    if depth > FINDER_DEPTH {
-        return false;
-    }
-    read_line(text).commands.iter().any(|command| {
-        let texts: Vec<String> = command.words.iter().map(|w| w.text.clone()).collect();
-        // `command -v NAME` is read as `command` itself, not as the launcher
-        // that runs `NAME`.
-        let first_finds = texts
-            .first()
-            .is_some_and(|first| PATH_FINDERS.contains(&program_name(first).as_str()));
-        let Some(at) = (if first_finds {
-            Some(0)
-        } else {
-            effective_command_index(&texts)
-        }) else {
-            return false;
-        };
-        let finder = program_name(&texts[at]);
-        if !PATH_FINDERS.contains(&finder.as_str()) {
-            return false;
-        }
-        let operands = &command.words[at + 1..];
-        // `command NAME` runs it; only `command -v` and `-V` print a path.
-        if finder == "command"
-            && !operands
-                .iter()
-                .any(|w| w.text.starts_with('-') && w.text.contains(['v', 'V']))
-        {
-            return false;
-        }
-        operands.iter().any(|word| {
-            if word.text.starts_with('-') && word.is_plain() {
-                return false;
-            }
-            names_guard_program(word)
-                || word
-                    .substitutions
-                    .iter()
-                    .any(|inner| prints_guard_program_path(inner, depth + 1))
-        })
-    })
-}
-
-/// Whether a word as written names one of the guard's programs, by its
-/// name or a path ending in it.
-fn names_guard_program(word: &Word) -> bool {
-    if !word.is_plain() {
-        return false;
-    }
-    let lower = word.text.to_ascii_lowercase();
-    let last = lower.rsplit('/').next().unwrap_or(&lower);
-    let bare = last.strip_suffix(".exe").unwrap_or(last);
+/// Whether `name` (lowercase) is one of the guard's programs.
+fn is_guard_program(name: &str) -> bool {
+    let bare = name.strip_suffix(".exe").unwrap_or(name);
     super::GUARD_PROGRAMS.contains(&bare)
 }
 
-/// Whether `word` is the path of one of the guard's programs as a
-/// substitution prints it (`"$(which innerwarden)"`, `` `command -v
-/// innerwarden` ``, `"$(readlink -f "$(which innerwarden)")"`), with
-/// nothing after it, or a brace expansion one of whose forms adds nothing
-/// (`"$(which innerwarden)"{,.off}`, which the shell hands as the program's
-/// path and a second name).
-fn found_guard_program(word: &Word) -> bool {
-    let starts_found = (word.text.starts_with("$(") || word.text.starts_with('`'))
-        && word.marks.first() == Some(&Mark::Expansion);
-    if !starts_found {
-        return false;
-    }
-    let Some(found) = word.substitutions.first() else {
-        return false;
-    };
-    if !prints_guard_program_path(found, 0) {
+/// Whether an operand the text does not show whole is one of the guard's
+/// programs: what the shell puts in its place (a substitution, an
+/// expansion, a pattern) names one of them anywhere in its text
+/// (`"$(which innerwarden)"`, `"$(hash -t innerwarden)"`,
+/// `"${commands[innerwarden]}"`, `"$(readlink /proc/$(pgrep -n
+/// innerwarden)/exe)"`, `$(find / -name innerwarden)`), or the path ends in
+/// one of their names (`"$(npm prefix -g)/bin/innerwarden"`, `"$D/iw"`).
+///
+/// A rule on the operand, not a list of the programs that find a path: a
+/// list named `which`, `command -v`, `type -P`, `readlink -f` and
+/// `realpath`, and `npm prefix -g`, `brew --prefix`, `hash -t`, `find`,
+/// `whereis`, a zsh `${commands[...]}` and a dozen more were each the
+/// guard's program moved aside under a name it did not read. A word the
+/// text shows whole is a path the other readings resolve; a name of the
+/// guard in the middle of a path through a value (`"$W/innerwarden/wt-1"`)
+/// is a folder, not the program.
+fn operand_names_guard_program(word: &Word) -> bool {
+    if word.is_plain() || word.marks.len() != word.text.chars().count() {
         return false;
     }
     let chars: Vec<char> = word.text.chars().collect();
-    let end = word
-        .marks
-        .iter()
-        .position(|mark| *mark != Mark::Expansion)
-        .unwrap_or(word.marks.len());
-    let rest = &chars[end..];
-    if rest.is_empty() {
+    // The text the shell replaces or matches, read as words: the name is
+    // one of them (`[innerwarden]`, `innerwarden)`, `innerwarden|`).
+    let mut token = String::new();
+    let mut names = false;
+    // A subscript right after an expansion (`"$commands[innerwarden]"`,
+    // zsh's table of the programs on the search path) is the expansion's.
+    let mut subscript = false;
+    let mut last_mark = Mark::Plain;
+    for (c, mark) in chars.iter().zip(&word.marks) {
+        if *mark == Mark::Plain {
+            if *c == '[' && last_mark == Mark::Expansion {
+                subscript = true;
+            } else if *c == ']' {
+                subscript = false;
+            }
+        }
+        last_mark = *mark;
+        let replaced = *mark != Mark::Plain || subscript;
+        let part_of_a_name =
+            replaced && (c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'));
+        if part_of_a_name {
+            token.push(c.to_ascii_lowercase());
+            continue;
+        }
+        names |= is_guard_program(&token);
+        token.clear();
+    }
+    names |= is_guard_program(&token);
+    if names {
         return true;
     }
-    // A brace expansion right after it, with an empty form among its own.
-    if rest[0] != '{' || word.marks[end] != Mark::Pattern {
-        return false;
-    }
-    let close = rest.iter().position(|c| *c == '}').unwrap_or(rest.len());
-    let inner: String = rest[1..close].iter().collect();
-    inner.contains(',') && inner.split(',').any(str::is_empty)
+    // The last part of the path, past the last `/` the shell leaves as it
+    // is, as written.
+    let start = chars
+        .iter()
+        .zip(&word.marks)
+        .rposition(|(c, mark)| *c == '/' && *mark == Mark::Plain)
+        .map(|at| at + 1);
+    start.is_some_and(|start| {
+        word.marks[start..].iter().all(|mark| *mark == Mark::Plain)
+            && is_guard_program(
+                &chars[start..]
+                    .iter()
+                    .collect::<String>()
+                    .to_ascii_lowercase(),
+            )
+    })
 }
 
 /// Whether a command of the line removes, moves, overwrites, links over or
-/// changes the mode or owner of one of the guard's programs found by a
-/// substitution that prints its path ([`found_guard_program`]): `mv
-/// "$(which innerwarden)" /tmp/x`, `rm -f "$(command -v innerwarden)"`, `cp
-/// /bin/true "$(which innerwarden)"`, `chmod 000 "$(type -P innerwarden)"`.
-/// A copy from it, a listing or a hash of it reads it, and is not here.
+/// changes the mode or owner of one of the guard's programs named in an
+/// operand the text does not show whole ([`operand_names_guard_program`]):
+/// `mv "$(which innerwarden)" /tmp/x`, `rm -f "$(hash -t innerwarden)"`,
+/// `mv "$(npm prefix -g)/bin/innerwarden" /tmp/x`, `cp /bin/true
+/// "${commands[innerwarden]}"`, `chmod 000 "$(type -P innerwarden)"`, a
+/// redirection or `tee` into one. A copy from it, a listing or a hash of it
+/// reads it, and is not here.
 ///
 /// Measured 2026-11-28 on pull request #471: each of those was held for
-/// review as a value the line does not show, and the same line with the
-/// path written out was refused.
+/// review as a value the line does not show, or let through, while main
+/// refused it and the same line with the path written out is refused.
 pub(super) fn found_guard_program_changed(content: &str) -> bool {
-    if !(content.contains("$(") || content.contains('`')) {
-        return false;
-    }
-    let lower = content.to_ascii_lowercase();
-    if !PATH_FINDERS.iter().any(|finder| lower.contains(finder)) {
+    if !(content.contains('$') || content.contains('`')) {
         return false;
     }
     let line = read_line(content);
     line.commands.iter().any(|command| {
-        if command.writes.iter().any(found_guard_program) {
+        if command.writes.iter().any(operand_names_guard_program) {
             return true;
         }
         let texts: Vec<String> = command.words.iter().map(|w| w.text.clone()).collect();
@@ -618,33 +580,33 @@ pub(super) fn found_guard_program_changed(content: &str) -> bool {
         match program.as_str() {
             // What it takes away, moves aside, empties or changes.
             "rm" | "unlink" | "shred" | "truncate" | "mv" | "chmod" | "chown" | "chgrp"
-            | "chattr" | "setfacl" => operands.into_iter().any(found_guard_program),
+            | "chattr" | "setfacl" | "trash" | "trash-put" | "tee" => {
+                operands.into_iter().any(operand_names_guard_program)
+            }
             // What it writes over: the last operand, the name it makes.
             "cp" | "install" | "ln" | "rsync" => operands
                 .last()
-                .is_some_and(|word| found_guard_program(word)),
+                .is_some_and(|word| operand_names_guard_program(word)),
             "dd" => args
                 .iter()
-                .any(|word| word.text.starts_with("of=") && found_guard_program_value(word, 3)),
-            "tee" => operands.into_iter().any(found_guard_program),
+                .any(|word| word.text.starts_with("of=") && operand_value_names_guard(word, 3)),
             _ => false,
         }
     })
 }
 
-/// [`found_guard_program`] of the value after the first `skip` characters
-/// of `word` (`of=$(which innerwarden)`).
-fn found_guard_program_value(word: &Word, skip: usize) -> bool {
+/// [`operand_names_guard_program`] of the value after the first `skip`
+/// characters of `word` (`of=$(which innerwarden)`).
+fn operand_value_names_guard(word: &Word, skip: usize) -> bool {
     if word.text.chars().count() <= skip || word.marks.len() <= skip {
         return false;
     }
     let value = Word {
         text: word.text.chars().skip(skip).collect(),
         marks: word.marks[skip..].to_vec(),
-        substitutions: word.substitutions.clone(),
         ..Word::default()
     };
-    found_guard_program(&value)
+    operand_names_guard_program(&value)
 }
 
 /// Whether a command of the line removes, moves, edits or writes a path

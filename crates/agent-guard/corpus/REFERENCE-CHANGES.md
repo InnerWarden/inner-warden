@@ -674,3 +674,16 @@ harmless. A malicious or `must_refuse` line cannot be waived here.
   host whose name holds `rm `, a long value spelled into arguments, the ssh
   client behind `rtk` or compared by a test, a read of the store held for
   review, and a build of the guard handed to a script by its path.
+- 2026-11-28: guard-lowering-evasions grows by gle-040 to gle-100, all
+  must_refuse, and gle-c08 to gle-c17 as controls; the reference does not
+  move. A package glued to cargo's option, cargo's own options before
+  `run`, a command an ssh client runs on this host from its options, a
+  loosening verb written anywhere after a name of the guard, and the
+  guard's program named in an operand the line does not show whole are
+  where the guard is read (`threats::program_places`,
+  `threats::guard_file_targets::found_guard_program_changed`).
+  harmless-proven:
+  guard-lowering-evasions/gle-c16
+  (`cp "$(which innerwarden)" /tmp/iw-copy`) goes from deny to review: a
+  copy from the guard's program reads it and changes nothing of it; the
+  guard's program as the destination of a copy stays refused (gle-055).
