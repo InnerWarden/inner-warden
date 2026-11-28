@@ -101,8 +101,7 @@ jobs:
   mutants-diff:
     name: cargo-mutants on the day's changes
     # Not on the Sunday cron: that slot runs the full sweep below. The plan,
-    # the shards and their verdict are in mutants-diff.yml, shared with the
-    # run on pull requests (mutants-pr.yml).
+    # the shards and their verdict are in mutants-diff.yml.
     if: github.event.schedule != '17 5 * * 0'
     uses: ./.github/workflows/mutants-diff.yml
     with:

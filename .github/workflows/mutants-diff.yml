@@ -4,9 +4,8 @@ name: Mutants on a diff
 # (crates/agent-guard/src): one plan, the mutants split into shards, each
 # shard's verdict (scripts/mutants-diff-verdict.sh) and one summary. Called by
 # the nightly run (nightly-deep.yml, what changed in the last 26 hours) and by
-# every pull request that changes the engine (mutants-pr.yml, what it
-# changes), so a mutant the tests do not catch shows on the pull request,
-# before the merge, and the nightly finds none left. One definition, so the
+# a manual run with a diff base. The mutants of a change are run before its
+# pull request, on our own machine, so the nightly finds none left. One definition, so the
 # two read the same plan and the same verdict.
 
 on:
