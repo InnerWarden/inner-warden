@@ -210,8 +210,10 @@ pub(crate) fn usage(verb: &str, rest: &[String]) -> Option<String> {
              Hook posture. With no flag the hook runs in the posture kept in\n  \
              ~/.config/innerwarden/posture: `default` (a new install's; `guard`, its\n  \
              earlier word, is read the same)\n  \
-             refuses only a hard secret read, destruction of the system or a home, an\n  \
-             act that takes the guard down, a reverse shell and download-and-run, and\n  \
+             refuses only a hard secret read, destruction of the system, a home or a\n  \
+             cloud resource, an act that takes the guard down, a reverse shell, the\n  \
+             machine's credentials from the cloud's metadata service, a library\n  \
+             preloaded from a temp folder and download-and-run, and\n  \
              every other deny or review runs with a one-line warning, recorded as\n  \
              would_block; `strict`, or no file, refuses every deny as earlier versions did.\n  \
              The MCP proxy's modes (`proxy --mode`) are its own; its `guard` is not\n  \

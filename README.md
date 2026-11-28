@@ -148,11 +148,15 @@ guard is highly certain of:
   logins, `/etc/shadow`, paths you declared protected) and a secrets file
   read from outside the project;
 - destruction of the system or of a home (`rm -rf /`, `rm -rf ~`, a disk
-  overwritten or formatted, every process killed);
+  overwritten or formatted, every process killed), and of a cloud resource
+  (`az group delete`, `gcloud projects delete`, `aws ec2
+  terminate-instances`);
 - an act that takes the guard down: its files or an agent's settings
   written or removed, the guard stopped or killed, security monitoring
   turned off;
-- a reverse shell;
+- a reverse shell, the machine's credentials asked of the cloud's metadata
+  service, a library preloaded from a folder anyone can write to
+  (`LD_PRELOAD=/tmp/...`);
 - something downloaded and run (`curl ... | sh`, a download made executable
   and started).
 

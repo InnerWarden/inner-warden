@@ -1042,6 +1042,20 @@ fn identifiers(text: &str) -> Vec<String> {
     found
 }
 
+/// Whether the comparison `place` is inside a single-bracket test (`[ "$n"
+/// -ge 8 ]`). Its operands are compared as integers and never evaluated:
+/// bash, zsh and sh all answer "integer expression expected" for
+/// `a[$(cmd)]` there and run nothing, where `[[ $n -ge 8 ]]` runs the
+/// substitution in the subscript (measured 2026-11-28, bash 3.2 and 5,
+/// zsh 5.9). So a value from the network compared in `[ ]` is a
+/// comparison, not arithmetic over outside text.
+fn in_single_bracket_test(place: tree_sitter::Node<'_>, source: &[u8]) -> bool {
+    ancestor_of_kind(place, "test_command").is_some_and(|test| {
+        let text = node_text(test, source);
+        text.starts_with('[') && !text.starts_with("[[")
+    })
+}
+
 /// Each variable bash reads as arithmetic or as a name on the line, with
 /// where the reading place starts: names in arithmetic (`$((X))`, `((X))`,
 /// `let n=X`, an arithmetic `[[` comparison, an integer declaration's
@@ -1079,6 +1093,7 @@ fn evaluated_name_reads(root: tree_sitter::Node<'_>, source: &[u8]) -> Vec<(usiz
             .is_some_and(|operator| {
                 ARITHMETIC_TESTS.contains(&node_text(operator, source).as_str())
             })
+            && !in_single_bracket_test(place, source)
         {
             add(&mut reads, place.start_byte(), &node_text(place, source));
         }
