@@ -290,20 +290,17 @@ fn quote(text: &str) -> String {
 }
 
 /// An assignment's value is read one level deeper than the line: nested
-/// past the levels read, a guard program named where a program runs is
-/// taken for a change.
+/// past the levels read, the guard's program named where a program runs is
+/// taken for a change. A chain of assignments with no blank in it is read
+/// only this way (a word with a blank is also read whole as a line).
 ///
 /// FAILS ON REVERT: read the value at the same level (`depth * 1` in
-/// `runs_text_of`) and the bottom `innerwarden status`, a read, is read and
+/// `runs_text_of`) and the bottom `innerwarden`, a bare name, is read and
 /// let through.
 #[test]
 fn an_assignment_value_nested_past_the_levels_read_is_a_change() {
-    let mut line = String::from("innerwarden status");
-    assert!(!changes_kernel_protection(&line), "{line}");
-    for at in 0..6 {
-        line = format!("A{at}={}", quote(&line));
-    }
-    assert!(changes_kernel_protection(&line), "{line}");
+    assert!(!changes_kernel_protection("A3=A2=A1=A0=innerwarden"));
+    assert!(changes_kernel_protection("A4=A3=A2=A1=A0=innerwarden"));
 }
 
 /// A store read nested in substitutions only a redirection holds, past the
@@ -331,7 +328,9 @@ fn a_store_read_or_a_removal_nested_past_the_levels_read_is_taken() {
 }
 
 /// A stop verb pairs with the guard's name only in the same command: the
-/// `;` right before the name ends the command the verb is in.
+/// `;` right before the name ends the command the verb is in. (`doctor`,
+/// not `status`: a line with an inspection verb is a read and never
+/// reaches the pairing.)
 ///
 /// FAILS ON REVERT: start the name's word at the `;` itself (`found * 1` in
 /// `check_disable_verb_reaches_target`) and the stop of another service
@@ -339,7 +338,7 @@ fn a_store_read_or_a_removal_nested_past_the_levels_read_is_taken() {
 #[test]
 fn a_stop_verb_pairs_with_the_name_only_in_its_own_command() {
     assert_eq!(
-        check_security_tamper("systemctl stop nginx;innerwarden status"),
+        check_security_tamper("systemctl stop nginx;innerwarden doctor"),
         None
     );
     assert!(check_security_tamper("systemctl stop innerwarden").is_some());

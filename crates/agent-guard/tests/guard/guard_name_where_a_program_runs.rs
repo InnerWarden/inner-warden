@@ -437,7 +437,8 @@ fn the_guards_program_found_by_a_substitution_and_moved_is_refused() {
 /// FAILS ON REVERT: take every finding seen on the remote line for one
 /// charged already (`indicator == GUARD_STORE_READ || ...` in
 /// `analyze_command_as_read`) and the `pkill` on another host is charged
-/// once.
+/// once; take any tamper finding seen for the same read (`... || ...`
+/// inside it) and the store read beside a remote `pkill` is not charged.
 #[test]
 fn a_read_of_the_guards_store_is_charged_once_with_its_reason() {
     for line in [
@@ -464,4 +465,17 @@ fn a_read_of_the_guards_store_is_charged_once_with_its_reason() {
         .filter(|signal| signal.signal == "security_tooling_tamper")
         .count();
     assert_eq!(tampers, 2, "{line}: {:?}", analysis.signals);
+    // A store read on this host is charged even where the remote line was
+    // charged for another finding: only the same read is charged once.
+    let line = "ssh h1 'pkill -f proxy'; cat /var/lib/innerwarden/d.jsonl";
+    let analysis = analyze_command(line, None);
+    let store_reads = analysis
+        .signals
+        .iter()
+        .filter(|signal| {
+            signal.signal == "security_tooling_tamper"
+                && signal.detail.contains("reads the guard's own store")
+        })
+        .count();
+    assert_eq!(store_reads, 1, "{line}: {:?}", analysis.signals);
 }
