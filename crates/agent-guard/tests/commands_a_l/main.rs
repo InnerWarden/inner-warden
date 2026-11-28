@@ -9,6 +9,7 @@ mod agent_instruction_orders;
 mod agent_settings_outside_the_real_home;
 mod answer_orders_cost;
 mod at_job_from_pipe;
+mod attack_text_as_data_and_cloud_destruction;
 mod backup_copy_of_settings;
 mod bench_benign_shapes;
 mod cd_then_glob_and_recursive_owner;

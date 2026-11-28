@@ -453,10 +453,17 @@ An enforcing hook line with no mode flag runs in the posture kept in
     `protected_secret_read`; a secrets file read from outside the project,
     `credential_read_outside_project`);
   - destruction of the system or of a home (`destructive_command`, and the
-    pattern findings "rm -rf of root" and "dd raw-device overwrite");
+    pattern findings "rm -rf of root" and "dd raw-device overwrite"), and
+    of a cloud resource (`cloud_resource_destruction`: a resource group, a
+    project, a virtual machine or a disk deleted, instances terminated);
   - an act that takes the guard down (`guard_self_disable`,
     `security_tooling_tamper`, Cursor's hooks file losing the guard);
-  - a reverse shell (`reverse_shell`);
+  - a reverse shell (`reverse_shell`), the machine's credentials asked of
+    the cloud's metadata service (the pattern finding "cloud instance
+    credential endpoint"; the host's name or region read from it only
+    warns), a library preloaded from a folder anyone can write to (the
+    pattern finding "preloads a library from a folder anyone can write to";
+    a library of the project only warns);
   - download and run (`download_and_execute`, `download_chmod_execute`,
     `dynamic_code_execution`, `download_run_in_text_argument`,
     `fetch_exec_unparsed`, `fetch_exec_unanalyzable`, and the pattern

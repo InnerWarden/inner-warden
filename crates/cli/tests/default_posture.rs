@@ -1,8 +1,10 @@
 //! End-to-end: the posture of an enforcing hook (`innerwarden_agent_guard::posture`).
 //!
 //! The default posture of a new install refuses the high-certainty class only
-//! (a hard secret read, destruction of the system or a home, the guard taken
-//! down by an act, a reverse shell, download and run). Every other refusal of
+//! (a hard secret read, destruction of the system, a home or a cloud
+//! resource, the guard taken down by an act, a reverse shell, the machine's
+//! credentials from the cloud's metadata service, a library preloaded from
+//! a temp folder, download and run). Every other refusal of
 //! the rules, and every review, runs: it is recorded as `would_block` and the
 //! agent shows the person one line. The strict posture is the enforce of
 //! earlier versions. A home with no posture file is strict.

@@ -923,7 +923,7 @@ attack-2026-11	a11-513	allow
 attack-2026-11	a11-514	allow
 attack-2026-11	a11-515	allow
 real	real-001	allow
-real	real-002	deny
+real	real-002	review
 real	real-003	deny
 real	real-004	allow
 real	real-005	review

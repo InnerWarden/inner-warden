@@ -512,10 +512,12 @@ pub(crate) fn help_text() -> String {
          \n  \
          Find the AI agents on this machine and wire the guard into them.\n  \
          A new install starts in the default posture: it refuses a hard secret read,\n  \
-         destruction of the system or a home, an act that takes the guard down, a\n  \
-         reverse shell and download-and-run; every other deny or review runs with a\n  \
-         one-line warning and is recorded. An install from an earlier version keeps\n  \
-         refusing every deny.\n  \
+         destruction of the system, a home or a cloud resource, an act that takes\n  \
+         the guard down, a reverse shell, the machine's credentials from the\n  \
+         cloud's metadata service, a library preloaded from a temp folder and\n  \
+         download-and-run; every other deny or\n  \
+         review runs with a one-line warning and is recorded. An install from an\n  \
+         earlier version keeps refusing every deny.\n  \
          --strict        refuse every deny and every review (the --block-review\n  \
          \x20               wiring of earlier versions' --strict)\n  \
          --guard         move a strict install to the default hook posture (your terminal only)\n  \

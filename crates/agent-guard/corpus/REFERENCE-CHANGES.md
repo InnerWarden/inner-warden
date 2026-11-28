@@ -687,3 +687,35 @@ harmless. A malicious or `must_refuse` line cannot be waived here.
   (`cp "$(which innerwarden)" /tmp/iw-copy`) goes from deny to review: a
   copy from the guard's program reads it and changes nothing of it; the
   guard's program as the destination of a copy stays refused (gle-055).
+- 2026-11-28: attack-text-as-data-2026-11 is new. An attack's words as
+  data are held for review, not refused: a line denied only for an
+  attack's words read as text (a reverse shell, the cloud's metadata
+  address, an account put in a root group, a table dropped, the record
+  wiped: `mcp::ATTACK_TEXT_SIGNALS`) and for the guard's own words, whose
+  data slots blanked are allowed, is held for review as a mention of the
+  guard's name is (`attack_text_as_data`); inline Python is read for the
+  words that make it act outside its string literals and comments
+  (`mention::python_outside_strings`), an f-string whole. A cloud
+  resource destroyed is refused in both postures
+  (`threats::check_cloud_resource_destruction`, in the high-certainty
+  class), with a redirection or a quote between its words as well, and so
+  are the machine's credentials asked of the cloud's metadata service and
+  a library preloaded from a folder anyone can write to. A value from the
+  network compared in single brackets or by `test` is a comparison
+  (`shell::in_single_bracket_test`); in double brackets, `$(( ))` or
+  `let` it stays refused. A recursive delete whose target is a variable
+  the line gave a folder of its own is judged by that folder
+  (`threats::delete_variable_names_a_subfolder`); a folder of the system
+  at any depth, a home, an empty value or one the line does not give
+  stays refused. In the release safety suite real-002 goes from deny to
+  review. The atd-1NN lines are must_refuse, held by
+  `tests/commands_a_l/attack_text_as_data_and_cloud_destruction.rs`.
+  Against the merge base no must_refuse line or variant of any corpus
+  moved to a weaker verdict, in the empty home and in the home with keys.
+  harmless-proven:
+  real/real-002 attack-text-as-data-2026-11/atd-001 attack-text-as-data-2026-11/atd-002 attack-text-as-data-2026-11/atd-004 attack-text-as-data-2026-11/atd-005 attack-text-as-data-2026-11/atd-006 attack-text-as-data-2026-11/atd-007 attack-text-as-data-2026-11/atd-008 attack-text-as-data-2026-11/atd-011
+  go from deny to review or allow for the reasons above: an edit of a
+  source file or of test fixtures whose text quotes an attack, a count a
+  remote command printed compared in single brackets, a status code curl
+  printed compared the same way, and a delete of a build folder the line
+  named.

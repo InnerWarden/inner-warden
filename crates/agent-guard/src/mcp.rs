@@ -3482,6 +3482,7 @@ pub const SIGNAL_NAMES: &[&str] = &[
     "bare_ip_fetch",
     "clone_and_run",
     "cloud_control_plane",
+    "cloud_resource_destruction",
     "container_escape",
     "credential_exposure",
     "credential_hunt",
@@ -3499,6 +3500,7 @@ pub const SIGNAL_NAMES: &[&str] = &[
     "fetch_exec_written_script",
     "guard_self_disable",
     "guard_word_mention",
+    "attack_text_as_data",
     "insecure_permissions",
     "internal_network_target",
     "kubernetes_escalation",
@@ -3924,6 +3926,7 @@ const REMOTE_HANDS_ON: &str = "in the line ssh runs on another host";
 /// that line, not this one's.
 const ANY_HOST_SIGNALS: &[&str] = &[
     "data_destruction",
+    "cloud_resource_destruction",
     "destructive_command",
     "dangerous_command",
     "cloud_control_plane",
@@ -3972,6 +3975,30 @@ const GUARD_WORD_SIGNALS: &[&str] = &[
     "dangerous_command",
     "persistence_install",
 ];
+
+/// The signals an attack's words earn read as text: a reverse shell, the
+/// cloud's metadata address, an account put in a root group or a library
+/// preloaded, a table dropped, the record wiped. Written into a file or
+/// handed to a program as data they run nothing, and a line denied only
+/// for them and for the guard's own words ([`GUARD_WORD_SIGNALS`]), whose
+/// data slots blanked are allowed, is held for review
+/// ([`ATTACK_TEXT_AS_DATA`]). The same words run (piped to a shell, after
+/// `-c`, in an `eval`, in a file the line writes and then runs) are still
+/// refused: the masking leaves every slot that runs anything as it is.
+const ATTACK_TEXT_SIGNALS: &[&str] = &[
+    "reverse_shell",
+    "internal_network_target",
+    "local_credential_or_kernel_tamper",
+    "data_destruction",
+    "anti_forensics",
+];
+
+/// What a line held for an attack's words as data is told.
+pub const ATTACK_TEXT_AS_DATA: &str =
+    "holds an attack's words (a reverse shell, the cloud's metadata address, an account given \
+     root, a table dropped) only as data: text written into a file, a search pattern, a message, \
+     a string in code that runs nothing: held for review, not refused. The same words run are \
+     still refused";
 
 /// What a line held for naming the guard, or what it refuses, as data is
 /// told.
@@ -4066,11 +4093,21 @@ fn cat_notes_as_text(
 /// The line is written again with every slot that only names something
 /// masked ([`crate::mention::masked`]) and judged again. The refusal is
 /// lowered only when every charged signal of the line is one of the guard's
-/// own families ([`GUARD_WORD_SIGNALS`]) and the masked line is allowed:
+/// own families ([`GUARD_WORD_SIGNALS`]) or an attack's words read as text
+/// ([`ATTACK_TEXT_SIGNALS`]), and the masked line is allowed:
 /// a secret read, a download run or any other finding keeps the refusal
 /// whatever slot it stands in, and so does a line the masked reading still
 /// holds for review (a file the line reads by a path that is no argument,
 /// measured 2026-11-21: no line of the corpora's gain is lost by it).
+///
+/// An attack's words as data are held the same way (2026-11-28): a probe
+/// list written into a test file, a detector's source that quotes the
+/// command it detects. Measured on the operator's own work of 20 to 27/11:
+/// 30 such lines refused under the default posture, every one an edit of
+/// source or notes. Inline code is masked only when every file it opens is
+/// the project's and it runs, sends and loads nothing
+/// ([`crate::mention::code_may_act`]), so a reverse shell written into a
+/// cron file or a startup file stays refused.
 fn mention_only(
     command: &str,
     cwd: Option<&str>,
@@ -4081,7 +4118,14 @@ fn mention_only(
         .signals
         .iter()
         .filter(|signal| signal.score > 0)
-        .all(|signal| GUARD_WORD_SIGNALS.contains(&signal.signal.as_str()));
+        .all(|signal| {
+            GUARD_WORD_SIGNALS.contains(&signal.signal.as_str())
+                || ATTACK_TEXT_SIGNALS.contains(&signal.signal.as_str())
+        });
+    let attack_words = analysis
+        .signals
+        .iter()
+        .any(|signal| signal.score > 0 && ATTACK_TEXT_SIGNALS.contains(&signal.signal.as_str()));
     // An action on the guard read whole (inline code that changes its
     // files or signals it, a copy onto its places, a program a search runs
     // on them, a file size limit lowered on the agent that starts its hook)
@@ -4106,10 +4150,18 @@ fn mention_only(
         return analysis;
     }
     let lift = 20u32.saturating_sub(lowered.risk_score);
-    lowered.signals.push(AnalysisSignal {
-        signal: "guard_word_mention".into(),
-        score: lift,
-        detail: GUARD_WORD_MENTION.into(),
+    lowered.signals.push(if attack_words {
+        AnalysisSignal {
+            signal: "attack_text_as_data".into(),
+            score: lift,
+            detail: ATTACK_TEXT_AS_DATA.into(),
+        }
+    } else {
+        AnalysisSignal {
+            signal: "guard_word_mention".into(),
+            score: lift,
+            detail: GUARD_WORD_MENTION.into(),
+        }
     });
     lowered.risk_score += lift;
     lowered.recommendation = recommendation_for_score(lowered.risk_score).to_string();
@@ -5399,6 +5451,18 @@ fn analyze_command_as_read(
     if let Some((what, s)) = threats::check_data_destruction(command_scan) {
         signals.push(AnalysisSignal {
             signal: "data_destruction".into(),
+            score: s,
+            detail: what.to_string(),
+        });
+        score += s;
+    }
+
+    // A cloud resource destroyed for good (a resource group, a project, a
+    // virtual machine, a disk): refused in both postures, as a block device
+    // formatted is.
+    if let Some((what, s)) = threats::check_cloud_resource_destruction(command_scan) {
+        signals.push(AnalysisSignal {
+            signal: "cloud_resource_destruction".into(),
             score: s,
             detail: what.to_string(),
         });
@@ -6928,6 +6992,68 @@ fn check_shell_internal_target(command: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A line held for a mention is named by the findings that charged it:
+    /// an attack's words only when one of them charged the line. A finding
+    /// scored 0 (a subsumed duplicate) never decides, so it does not name
+    /// the lowered line either.
+    ///
+    /// FAILS ON REVERT of the charged-only test in [`mention_only`]: a
+    /// subsumed reverse shell beside the guard's words named the line as
+    /// an attack's words.
+    #[test]
+    fn a_subsumed_attack_finding_does_not_name_a_mention() {
+        let signal = |name: &str, score: u32| AnalysisSignal {
+            signal: name.into(),
+            score,
+            detail: name.into(),
+        };
+        let verdict = |signals: Vec<AnalysisSignal>| {
+            let risk_score = signals.iter().map(|s| s.score).sum();
+            CommandAnalysis {
+                command: String::new(),
+                risk_score,
+                severity: "high".into(),
+                signals,
+                recommendation: recommendation_for_score(risk_score).into(),
+                explanation: String::new(),
+                atr_matches: Vec::new(),
+                asi_ids: Vec::new(),
+            }
+        };
+        let line = "grep -rn innerwarden-agent src";
+        let allowed = |_: &str| verdict(Vec::new());
+        let named = |signals: Vec<AnalysisSignal>| {
+            mention_only(line, None, verdict(signals), allowed)
+                .signals
+                .into_iter()
+                .filter(|s| s.score > 0)
+                .map(|s| s.signal)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            named(vec![
+                signal("guard_self_disable", 60),
+                signal("reverse_shell", 0)
+            ]),
+            vec!["guard_word_mention".to_string()]
+        );
+        assert_eq!(
+            named(vec![
+                signal("guard_self_disable", 60),
+                signal("reverse_shell", 60)
+            ]),
+            vec!["attack_text_as_data".to_string()]
+        );
+        // A subsumed finding of another family does not keep the refusal.
+        assert_eq!(
+            named(vec![
+                signal("guard_self_disable", 60),
+                signal("download_and_execute", 0)
+            ]),
+            vec!["guard_word_mention".to_string()]
+        );
+    }
 
     /// A name the remote line is charged with is a name a check raises: a
     /// misspelt one would leave that finding uncharged on the other host.

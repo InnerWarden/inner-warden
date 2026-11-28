@@ -168,7 +168,12 @@ pub const DANGEROUS_COMMANDS: &[CommandPattern] = &[
         block: true,
     },
     CommandPattern {
-        pattern: r"(?i)169\.254\.169\.254/(?:latest/meta-data/iam/security-credentials|metadata/identity/oauth2/token)",
+        // The machine's credentials, asked of the cloud's metadata service:
+        // EC2 (also its IPv6 address), Azure's managed identity, GCP's
+        // service account token and ECS's task credentials. Refused in the
+        // default posture too (`crate::posture::HIGH_CERTAINTY_PATTERNS`);
+        // the host's name or region read from the same service only warns.
+        pattern: r"(?i)(?:169\.254\.169\.254|\[?fd00:ec2::254\]?)/(?:latest/meta-data/iam/security-credentials|metadata/identity/oauth2/token)|metadata\.google\.internal/computeMetadata/v1/instance/service-accounts/[^\s/]*/(?:token|identity)|169\.254\.170\.2/v[0-9]+/credentials",
         description: "cloud instance credential endpoint",
         block: true,
     },
@@ -292,6 +297,17 @@ pub const DANGEROUS_COMMANDS: &[CommandPattern] = &[
     // to execute /tmp/x with no "dangerous" token in the visible command). None of
     // these belong in a tool-call. LD_LIBRARY_PATH / PYTHONPATH are deliberately
     // excluded (legit build/runtime uses); only the exec-on-load vectors are here.
+    CommandPattern {
+        // A library preloaded from a folder anyone can write to (`/tmp`,
+        // `/var/tmp`, `/dev/shm`): the library planted there runs inside every
+        // program the line starts. Before the general preload pattern, so
+        // the finding names it and the default posture refuses it as well
+        // (`crate::posture::HIGH_CERTAINTY_PATTERNS`); a library of the
+        // project (`LD_PRELOAD=./build/libfake.so`) stays a warning there.
+        pattern: r#"(?i)\b(?:LD_PRELOAD|LD_AUDIT)\s*=\s*["']?(?:[^\s"':;&|]*:)*(?:/private)?(?:/tmp|/var/tmp|/dev/shm)/"#,
+        description: "preloads a library from a folder anyone can write to",
+        block: true,
+    },
     CommandPattern {
         // `\b` boundary (not a whitespace class) so it fires whether the var is at
         // the start, space-separated (`env BASH_ENV=`), or quote-preceded, the
@@ -11659,8 +11675,6 @@ pub fn check_data_destruction(content: &str) -> Option<(&'static str, u32)> {
             "drop schema",
             "terraform",
             "kubectl",
-            "az ",
-            "gcloud",
         ],
     ) {
         return None;
@@ -11700,24 +11714,191 @@ pub fn check_data_destruction(content: &str) -> Option<(&'static str, u32)> {
                 r"(?i)\bkubectl\b[^|;&]*\bdelete\b[^|;&]*--all\b",
                 "deletes every resource of a kind at once",
             ),
-            (
-                r"(?i)\baz\b[^|;&]*\b(?:storage\s+account|group|sql\s+server)\b[^|;&]*\bdelete\b[^|;&]*--yes\b",
-                "deletes Azure storage or a resource group without confirmation",
-            ),
-            (
-                r"(?i)\bgcloud\b[^|;&]*\b(?:sql\s+instances|projects|storage\s+buckets)\b[^|;&]*\bdelete\b[^|;&]*(?:--quiet|-q)\b",
-                "deletes a Cloud SQL instance, project or bucket without confirmation",
-            ),
         ]
         .into_iter()
         .filter_map(|(p, d)| regex::Regex::new(p).ok().map(|re| (re, d)))
         .collect()
     });
+    // A delete whose target is a variable the line itself gives a value is
+    // judged by the path that value makes ([`delete_variable_names_a_subfolder`]):
+    // its pattern is the second of the list.
+    let variable_target = &res[1].0;
+    let charged = |text: &str| {
+        res.iter().enumerate().find(|(index, (re, _))| {
+            re.is_match(text)
+                && !(*index == 1 && delete_variable_names_a_subfolder(text, variable_target))
+        })
+    };
     // Check the RAW form for every pattern first and normalize ONLY if nothing
     // matched. `normalize_command` runs several regex passes, and this function
     // is on the hot path of every tool call an agent makes: paying for it
     // eagerly, once per detector, is what pushed a burst past the session
     // layer's one-minute window under instrumentation.
+    if let Some((_, (_, what))) = charged(content) {
+        return Some((*what, 60));
+    }
+    let normalized = normalize_command(content);
+    if normalized == content {
+        return None;
+    }
+    charged(&normalized).map(|(_, (_, what))| (*what, 60))
+}
+
+/// Whether every recursive delete of `content` whose target is a variable
+/// (`unseen` matches it) has that target given by the line before it, and
+/// the path it makes is a folder of its own: `D=/home/u/work/proj/build; rm
+/// -rf "$D/"` removes that build folder, as `rm -rf /home/u/work/proj/build/`
+/// written out does.
+///
+/// The value is the one in effect where the delete runs
+/// ([`crate::line_values::readings_in_effect`]): a value the line does not
+/// give (from a substitution, read from input, set in a closed subshell,
+/// never set), or one it gives that leaves a variable in the target, is
+/// not seen and the delete is still refused. So is a target that resolves
+/// to more than one folder of its own: the root or a top-level folder, a
+/// home or the folder of homes, `/private/<x>`, a path that climbs with
+/// `..`, the working folder itself, an empty value, a glob in the first two
+/// places ([`resolved_delete_target_is_one_folder`]).
+///
+/// Measured 2026-11-27 on the operator's own work: 92 deletes under the
+/// strict posture, each of a folder the same line had named a moment before.
+fn delete_variable_names_a_subfolder(content: &str, unseen: &regex::Regex) -> bool {
+    let Some(reading) = crate::line_values::readings_in_effect(content)
+        .into_iter()
+        .next()
+    else {
+        return false;
+    };
+    if unseen.is_match(&reading) {
+        return false;
+    }
+    let mut targets = 0usize;
+    for segment in shell_command_segments(&reading) {
+        let Some(rm) = segment_rm_invocation(segment) else {
+            continue;
+        };
+        if !rm.recursive {
+            continue;
+        }
+        for target in &rm.targets {
+            if !resolved_delete_target_is_one_folder(target) {
+                return false;
+            }
+            targets += 1;
+        }
+    }
+    targets > 0
+}
+
+/// Whether `target`, a delete target with no variable left in it, names one
+/// folder of its own (see [`delete_variable_names_a_subfolder`]).
+fn resolved_delete_target_is_one_folder(target: &str) -> bool {
+    if target.is_empty()
+        || target.contains(['$', '`'])
+        || rm_target_is_root_or_system(target)
+        || rm_target_is_home(target)
+    {
+        return false;
+    }
+    let base = rm_target_base(target);
+    if base.split('/').any(|part| part == "..") || matches!(base, "." | "./" | "~") {
+        return false;
+    }
+    if let Some(rest) = base.strip_prefix('/') {
+        let parts: Vec<&str> = rest.split('/').filter(|part| !part.is_empty()).collect();
+        if parts.len() < 2
+            || parts
+                .iter()
+                .take(2)
+                .any(|part| part.contains(['*', '?', '[', '{']))
+        {
+            return false;
+        }
+        // Under a folder of the system (`/etc`, `/usr`, `/var`, `/srv`), at
+        // any depth: a value the line moved there (`export PWD=/etc`,
+        // `export HOME=/srv`) is not a folder of the work. Below the folder
+        // of homes only a home itself is refused, by `rm_target_is_home`.
+        if RM_SYSTEM_DIRS.contains(&parts[0]) && !matches!(parts[0], "home" | "Users" | "users") {
+            return false;
+        }
+        // `/private/tmp` and `/private/var` are `/tmp` and `/var` on macOS.
+        return !(parts[0] == "private" && parts.len() < 3);
+    }
+    true
+}
+
+/// Irreversible destruction of a cloud resource that holds others or holds
+/// data: a resource group, a virtual machine, a disk, a project, an account
+/// or a subscription, a stack, instances, storage and database servers.
+///
+/// Refused in both postures, as formatting a block device is: there is no
+/// undo, and what goes with a resource group or a project is everything in
+/// it. The verbs whose interactive form asks first (`az group delete`
+/// without `--yes`) are refused too: an agent answers the prompt by piping
+/// a `y` into it, and a person who means it runs it from their own
+/// terminal.
+///
+/// Measured 2026-11-27: the default posture let four `az group delete
+/// --yes` run with a warning, each a whole resource group.
+pub fn check_cloud_resource_destruction(content: &str) -> Option<(&'static str, u32)> {
+    // The program's name alone: a redirection or a quote may follow it.
+    if !mentions_any(content, &["az", "gcloud", "aws"]) {
+        return None;
+    }
+    static RES: std::sync::OnceLock<Vec<(regex::Regex, &'static str)>> = std::sync::OnceLock::new();
+    let res = RES.get_or_init(|| {
+        // Between two words of the command: blanks, and what the shell drops
+        // or joins there, a redirection (`group>/dev/null delete`) or a word
+        // in quotes (`$'group' delete`).
+        let sep = r#"['"]?(?:\s*\d*[<>]+[^\s|;&'"]*)*\s+\$?['"]?"#;
+        // `az`'s global options in front of the resource kind.
+        let az = r"\baz(?:\s+--?[a-z][\w-]*(?:[=\s]+[^\s-][^\s|;&]*)?)*";
+        [
+            (
+                // The resource kind right after `az` and its global options:
+                // `az ad group delete` removes a directory group, and `az
+                // group deployment delete` a deployment's record, not a
+                // resource group.
+                format!(r"(?i){az}{sep}(?:group|vm|disk|snapshot|vmss){sep}delete\b"),
+                "deletes an Azure resource group, virtual machine or disk",
+            ),
+            (
+                r"(?i)\baz\b[^|;&]*\b(?:storage\s+account|sql\s+server|cosmosdb|keyvault|account|subscription|account\s+management-group)\b[^|;&]*\bdelete\b[^|;&]*(?:--yes|-y)\b".to_string(),
+                "deletes Azure storage, a database server, an account or a subscription without confirmation",
+            ),
+            (
+                format!(r"(?i)\bgcloud\b[^|;&]*?\bprojects{sep}delete\b"),
+                "deletes a Google Cloud project and everything in it",
+            ),
+            (
+                r"(?i)\bgcloud\b[^|;&]*\b(?:sql\s+instances|storage\s+buckets|compute\s+instances|compute\s+disks|organizations|billing\s+accounts)\b[^|;&]*\bdelete\b[^|;&]*(?:--quiet|-q)\b".to_string(),
+                "deletes a Google Cloud instance, disk, bucket or database without confirmation",
+            ),
+            (
+                format!(r"(?i)\baws\b[^|;&]*?\bcloudformation{sep}delete-stack\b"),
+                "deletes an AWS CloudFormation stack and the resources it made",
+            ),
+            (
+                format!(r"(?i)\baws\b[^|;&]*?\bec2{sep}terminate-instances\b"),
+                "terminates AWS instances",
+            ),
+            (
+                format!(r"(?i)\baws\b[^|;&]*?\borganizations{sep}(?:close-account|delete-organization)\b"),
+                "closes an AWS account or deletes the organization",
+            ),
+            (
+                format!(r"(?i)\baws\b[^|;&]*?\bs3{sep}rb\b[^|;&]*--force\b"),
+                "deletes an S3 bucket and everything in it",
+            ),
+            (
+                format!(r"(?i)\baws\b[^|;&]*?\brds{sep}delete-db-(?:instance|cluster)\b[^|;&]*--skip-final-snapshot\b"),
+                "deletes an AWS database with no final snapshot",
+            ),
+        ]
+        .into_iter()
+        .filter_map(|(p, d)| regex::Regex::new(&p).ok().map(|re| (re, d)))
+        .collect()
+    });
     if let Some((_, what)) = res.iter().find(|(re, _)| re.is_match(content)) {
         return Some((*what, 60));
     }
@@ -29829,7 +30010,7 @@ mod tests {
             27,
             "prompt-injection pattern count"
         );
-        assert_eq!(DANGEROUS_COMMANDS.len(), 41, "dangerous-command count");
+        assert_eq!(DANGEROUS_COMMANDS.len(), 42, "dangerous-command count");
         assert_eq!(API_KEY_PATTERNS.len(), 7, "API-key pattern count");
     }
 }
@@ -31865,10 +32046,85 @@ mod round_three_rule_tests {
             "terraform apply -destroy -auto-approve -var-file=env/prod.tfvars",
             "kubectl delete namespace payments-prod",
             "kubectl delete pvc --all -n payments-prod",
+        ] {
+            assert!(check_data_destruction(cmd).is_some(), "{cmd}");
+        }
+        // A cloud's storage or database destroyed is its own finding,
+        // refused in both postures.
+        for cmd in [
             "az storage account delete --name acmeprodstmts --yes",
             "gcloud sql instances delete ledger-prod --quiet",
         ] {
-            assert!(check_data_destruction(cmd).is_some(), "{cmd}");
+            assert!(check_cloud_resource_destruction(cmd).is_some(), "{cmd}");
+            assert!(check_data_destruction(cmd).is_none(), "{cmd}");
+        }
+    }
+
+    /// A delete of a variable is waived only when the line gives the value
+    /// and the delete is there to judge: a line with no recursive delete
+    /// once its values are read in waives nothing.
+    #[test]
+    fn a_variable_delete_is_waived_only_for_a_delete_it_can_judge() {
+        let unseen = regex::Regex::new(
+            r#"(?i)\brm\b[^|;&]*-[a-z]*r[a-z]*f?[^|;&]*\s["']?\$\{?[A-Z_][A-Z0-9_]*\}?["']?/"#,
+        )
+        .expect("the variable target pattern");
+        assert!(delete_variable_names_a_subfolder(
+            "D=/home/u/work/proj/build; rm -rf \"$D/\"",
+            &unseen
+        ));
+        assert!(!delete_variable_names_a_subfolder(
+            "rm -rf \"$D/\"",
+            &unseen
+        ));
+        assert!(!delete_variable_names_a_subfolder(
+            "D=/home/u/work/proj/build; ls \"$D/\"",
+            &unseen
+        ));
+    }
+
+    /// The path a variable target resolves to is one folder of the work only
+    /// below a folder of its own: never the root, a top-level folder, a
+    /// folder of the system at any depth, a home or the folder of homes,
+    /// macOS's `/private/<x>`, a climb, a glob in the first two places, the
+    /// working folder, or a target that still holds a variable.
+    #[test]
+    fn a_resolved_delete_target_is_one_folder_only_below_one_of_its_own() {
+        for target in [
+            "/home/u/work/proj/build",
+            "/home/u/work/proj/build/",
+            "/tmp/x1",
+            "/private/tmp/s1/out",
+            "/private/tmp/s1",
+            "/Users/u/work/out",
+            "build/out",
+            "~/work/out",
+        ] {
+            assert!(resolved_delete_target_is_one_folder(target), "{target}");
+        }
+        for target in [
+            "",
+            "/",
+            "/x",
+            "/etc",
+            "/etc/x",
+            "/srv/app/data",
+            "/usr/local/lib",
+            "/home",
+            "/home/u",
+            "/Users/u/",
+            "/private/tmp",
+            "/private/var/",
+            "/a/*/b",
+            "/home/u/work/../..",
+            "../x",
+            ".",
+            "./",
+            "~",
+            "$X/a",
+            "`pwd`/a",
+        ] {
+            assert!(!resolved_delete_target_is_one_folder(target), "{target}");
         }
     }
 
@@ -32808,11 +33064,19 @@ mod family_gate_tests {
             ),
             (
                 "az storage account delete --name x --yes",
-                check_data_destruction,
+                check_cloud_resource_destruction,
             ),
             (
                 "gcloud sql instances delete ledger-prod --quiet",
-                check_data_destruction,
+                check_cloud_resource_destruction,
+            ),
+            (
+                "az group delete -n rg1 --yes",
+                check_cloud_resource_destruction,
+            ),
+            (
+                "aws ec2 terminate-instances --instance-ids i-0abc",
+                check_cloud_resource_destruction,
             ),
             ("auditctl -D", check_anti_forensics),
             ("bpftool link detach id 118", check_anti_forensics),

